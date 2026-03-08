@@ -95,7 +95,7 @@ export default function SearchView({ bbox, onResults, onChunksChange }: Props) {
     setSearchError('')
     setActiveChunkId(null)
     try {
-      const res = await fetch(`${API}/search`, {
+      const res = await fetch(`${API}/search-real`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -121,7 +121,6 @@ export default function SearchView({ bbox, onResults, onChunksChange }: Props) {
 
   // ── Precompute bbox chunk ──────────────────────────────────────────────────
   async function handlePreprocess() {
-    if (!canPreprocess) return
     setPreprocessStatus('loading')
     setPreprocessMsg('')
     try {
@@ -155,9 +154,13 @@ export default function SearchView({ bbox, onResults, onChunksChange }: Props) {
     setResults([])
     onResults([])
     try {
-      const res = await fetch(
-        `${API}/search-chunk/${chunkId}?limit=${parseInt(limit, 10) || 25}`
-      )
+      const res = await fetch(`${API}/search-chunk/${chunkId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          limit: parseInt(limit, 10) || 25,
+        }),
+      })
       if (!res.ok) throw new Error(`Server responded with ${res.status}`)
       const data: SearchResponse = await res.json()
       const list = data.restaurants ?? []
