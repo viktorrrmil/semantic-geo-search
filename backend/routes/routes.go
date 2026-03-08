@@ -34,6 +34,7 @@ func SetupRoutes(duckdbService *services.DuckDBService) *gin.Engine {
 		v1.POST("/preprocess", restaurantHandler.PreprocessChunk)
 		v1.GET("/chunks", restaurantHandler.GetAvailableChunks)
 		v1.POST("/search-chunk/:chunkId", restaurantHandler.SearchChunk)
+		v1.GET("/chunks/:chunkId/geojson", restaurantHandler.GetChunkGeoJSON)
 	}
 
 	return r

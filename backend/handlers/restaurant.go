@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"examle.com/mod/models"
@@ -75,18 +76,12 @@ func (h *RestaurantHandler) SearchReal(c *gin.Context) {
 		req.Limit = 10
 	}
 
-	// Use ultra-fast search method for better performance
-	restaurants, err := h.duckdbService.SearchRestaurantsUltraFast(req)
+	restaurants, err := h.duckdbService.SearchRestaurants(req)
 	if err != nil {
-		// Fallback to regular search if ultra-fast fails
-		log.Printf("Ultra-fast search failed, trying regular search: %v", err)
-		restaurants, err = h.duckdbService.SearchRestaurants(req)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, models.SearchResponse{
-				Message: "Failed to search restaurants: " + err.Error(),
-			})
-			return
-		}
+		c.JSON(http.StatusInternalServerError, models.SearchResponse{
+			Message: "Failed to search restaurants: " + err.Error(),
+		})
+		return
 	}
 
 	response := models.SearchResponse{
@@ -167,6 +162,7 @@ func (h *RestaurantHandler) GetAvailableChunks(c *gin.Context) {
 // SearchChunk handles POST /search-chunk/:chunkId endpoint
 func (h *RestaurantHandler) SearchChunk(c *gin.Context) {
 	chunkID := c.Param("chunkId")
+	fmt.Printf("🔍 Received search request for chunk ID: %s from %s\n", chunkID, c.ClientIP())
 	if chunkID == "" {
 		c.JSON(http.StatusBadRequest, models.SearchResponse{
 			Message: "Chunk ID is required",
@@ -177,12 +173,33 @@ func (h *RestaurantHandler) SearchChunk(c *gin.Context) {
 	// Get limit from query parameter
 	limit := 10
 	if limitStr := c.Query("limit"); limitStr != "" {
-		if parsedLimit, err := fmt.Sscanf(limitStr, "%d", &limit); err != nil || parsedLimit != 1 {
-			limit = 10
+		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 {
+			limit = parsed
 		}
 	}
 
-	// Search within the precomputed chunk
+	// Attempt fast parquet-backed search using stored bbox metadata
+	meta, metaErr := h.duckdbService.GetChunkMetadata(chunkID)
+	if metaErr == nil {
+		// Try parquet search with stored bbox
+		restaurants, err := h.duckdbService.SearchParquetChunk(chunkID, meta.BboxMinX, meta.BboxMinY, meta.BboxMaxX, meta.BboxMaxY, limit)
+		if err == nil {
+			response := models.SearchResponse{
+				Restaurants: restaurants,
+				Total:       len(restaurants),
+				Message:     fmt.Sprintf("Found %d restaurants from parquet chunk %s", len(restaurants), chunkID),
+			}
+
+			c.JSON(http.StatusOK, response)
+			return
+		}
+		// Log parquet search failure and fall back
+		log.Printf("parquet search failed for chunk %s: %v; falling back to JSON", chunkID, err)
+	} else {
+		log.Printf("failed to load chunk metadata for %s: %v; falling back to JSON", chunkID, metaErr)
+	}
+
+	// Fallback: search in-memory using JSON chunk
 	restaurants, err := h.duckdbService.SearchFromChunk(chunkID, limit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.SearchResponse{
@@ -194,8 +211,35 @@ func (h *RestaurantHandler) SearchChunk(c *gin.Context) {
 	response := models.SearchResponse{
 		Restaurants: restaurants,
 		Total:       len(restaurants),
-		Message:     fmt.Sprintf("Found %d restaurants from precomputed chunk %s", len(restaurants), chunkID),
+		Message:     fmt.Sprintf("Found %d restaurants from precomputed chunk %s (fallback)", len(restaurants), chunkID),
 	}
 
 	c.JSON(http.StatusOK, response)
+}
+
+// GetChunkGeoJSON handles GET /chunks/:chunkId/geojson and returns the chunk as GeoJSON
+func (h *RestaurantHandler) GetChunkGeoJSON(c *gin.Context) {
+	chunkID := c.Param("chunkId")
+	if chunkID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"message": "Chunk ID is required"})
+		return
+	}
+
+	// Try fast export (parquet-backed)
+	geojsonBytes, err := h.duckdbService.ExportChunkAsGeoJSON(chunkID)
+	if err == nil {
+		c.Data(http.StatusOK, "application/geo+json", geojsonBytes)
+		return
+	}
+
+	log.Printf("failed to export chunk %s as geojson: %v; attempting fallback JSON read", chunkID, err)
+
+	// Fallback: load chunk JSON and convert to GeoJSON (via service loadChunk -> ExportChunkAsGeoJSON already handles fallback)
+	geojsonBytes, err = h.duckdbService.ExportChunkAsGeoJSON(chunkID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"message": "Failed to export chunk as GeoJSON: " + err.Error()})
+		return
+	}
+
+	c.Data(http.StatusOK, "application/geo+json", geojsonBytes)
 }

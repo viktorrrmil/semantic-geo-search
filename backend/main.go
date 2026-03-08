@@ -8,8 +8,8 @@ import (
 )
 
 func main() {
-	// Initialize DuckDB service
-	duckdbService, err := services.NewDuckDBService()
+	// Initialize DuckDB service (pass the source parquet path; change as needed)
+	duckdbService, err := services.NewDuckDBService("places_dubai.parquet")
 	if err != nil {
 		log.Fatal("Failed to initialize DuckDB service:", err)
 	}

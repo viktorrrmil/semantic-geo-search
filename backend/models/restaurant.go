@@ -30,7 +30,7 @@ type SearchResponse struct {
 
 // PreprocessRequest represents the request to preprocess a chunk
 type PreprocessRequest struct {
-	Category string  `json:"category" binding:"required"`
+	Category string  `json:"category,omitempty"` // Optional: when empty, preprocess all places in bbox
 	BboxMinX float64 `json:"bbox_min_x" binding:"required"`
 	BboxMaxX float64 `json:"bbox_max_x" binding:"required"`
 	BboxMinY float64 `json:"bbox_min_y" binding:"required"`

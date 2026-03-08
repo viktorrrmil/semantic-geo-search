@@ -3,12 +3,14 @@ package services
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,10 +23,11 @@ type DuckDBService struct {
 	db                 *sql.DB
 	spatialInitialized bool
 	chunksDir          string
+	sourceparquet      string // configurable source parquet path
 }
 
 // NewDuckDBService creates a new DuckDB service
-func NewDuckDBService() (*DuckDBService, error) {
+func NewDuckDBService(sourceParquet string) (*DuckDBService, error) {
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open DuckDB connection: %w", err)
@@ -37,8 +40,9 @@ func NewDuckDBService() (*DuckDBService, error) {
 	}
 
 	service := &DuckDBService{
-		db:        db,
-		chunksDir: chunksDir,
+		db:            db,
+		chunksDir:     chunksDir,
+		sourceparquet: sourceParquet,
 	}
 
 	// Initialize the database extensions
@@ -56,57 +60,33 @@ func (d *DuckDBService) Close() error {
 
 // initialize sets up the DuckDB extensions and configurations
 func (d *DuckDBService) initialize() error {
-	// For sample data mode, we don't need spatial extension
-	log.Println("DuckDB service initialized (sample data mode)")
 	return nil
 }
 
 // initializeSpatial sets up the spatial extension for real Overture queries
 func (d *DuckDBService) initializeSpatial() error {
-	// Skip if already initialized
 	if d.spatialInitialized {
-		log.Println("✅ Spatial extension already initialized, skipping...")
 		return nil
 	}
 
-	log.Println("🔧 Setting up spatial extension for Overture dataset access...")
+	_, _ = d.db.Exec("INSTALL httpfs")
+	_, _ = d.db.Exec("LOAD httpfs")
+	_, _ = d.db.Exec("SET s3_region='us-west-2'")
+	_, _ = d.db.Exec("SET threads=4")
+	_, _ = d.db.Exec("SET memory_limit='2GB'")
 
-	// Install spatial extension
-	log.Println("📦 Installing spatial extension...")
-	startTime := time.Now()
 	_, err := d.db.Exec("INSTALL spatial")
-	if err != nil {
-		log.Printf("⚠️  Warning: Failed to install spatial extension (may already be installed): %v", err)
-		log.Println("   This is usually fine if the extension was previously installed")
-	} else {
-		installDuration := time.Since(startTime)
-		log.Printf("✅ Spatial extension installed successfully in %.2f seconds", installDuration.Seconds())
-	}
 
 	// Load spatial extension
-	log.Println("🔄 Loading spatial extension...")
-	loadStart := time.Now()
 	_, err = d.db.Exec("LOAD spatial")
 	if err != nil {
-		log.Printf("❌ Failed to load spatial extension: %v", err)
 		return fmt.Errorf("failed to load spatial extension: %w", err)
 	}
-	loadDuration := time.Since(loadStart)
-	log.Printf("✅ Spatial extension loaded successfully in %.2f seconds", loadDuration.Seconds())
 
-	// Set S3 region
-	log.Println("🌎 Configuring S3 region for Overture dataset...")
-	regionStart := time.Now()
 	_, err = d.db.Exec("SET s3_region='us-west-2'")
 	if err != nil {
-		log.Printf("❌ Failed to set S3 region: %v", err)
 		return fmt.Errorf("failed to set S3 region: %w", err)
 	}
-	regionDuration := time.Since(regionStart)
-	log.Printf("✅ S3 region set to us-west-2 in %.2f seconds", regionDuration.Seconds())
-
-	totalSetupTime := time.Since(startTime)
-	log.Printf("🎉 Spatial setup completed in %.2f seconds total", totalSetupTime.Seconds())
 
 	d.spatialInitialized = true
 	return nil
@@ -114,137 +94,6 @@ func (d *DuckDBService) initializeSpatial() error {
 
 // SearchRestaurants searches for restaurants based on the given criteria
 func (d *DuckDBService) SearchRestaurants(req models.SearchRequest) ([]models.Restaurant, error) {
-	// Initialize spatial extension for real queries
-	if err := d.initializeSpatial(); err != nil {
-		return nil, fmt.Errorf("failed to initialize spatial extension: %w", err)
-	}
-
-	limit := req.Limit
-	if limit <= 0 || limit > 100 {
-		limit = 10 // Default to 10 results
-	}
-
-	// Optimized query with proper spatial and categorical filtering
-	query := `
-		SELECT
-			id,
-			names.primary as name,
-			confidence,
-			CAST(socials AS JSON) as socials,
-			ST_AsText(geometry) as geometry
-		FROM
-				read_parquet('s3://overturemaps-us-west-2/release/2026-02-18.0/theme=places/type=place/*', filename=true, hive_partitioning=1)
-		WHERE
-			categories.primary = $1
-			AND bbox.xmin >= $2 AND bbox.xmax <= $3
-			AND bbox.ymin >= $4 AND bbox.ymax <= $5
-			AND ST_Within(
-				geometry,
-				ST_MakeEnvelope($2, $4, $3, $5, 4326)
-			)
-		ORDER BY confidence DESC
-		LIMIT $6`
-
-	rows, err := d.db.Query(query, req.Category, req.BboxMinX, req.BboxMaxX, req.BboxMinY, req.BboxMaxY, limit)
-	if err != nil {
-		// If the optimized query fails, fall back to a simpler but still efficient query
-		log.Printf("Optimized query failed, trying fallback: %v", err)
-		return d.searchRestaurantsFallback(req)
-	}
-	defer rows.Close()
-
-	var restaurants []models.Restaurant
-	for rows.Next() {
-		var r models.Restaurant
-		var socialsStr sql.NullString
-
-		err := rows.Scan(&r.ID, &r.Name, &r.Confidence, &socialsStr, &r.Geometry)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan restaurant row: %w", err)
-		}
-
-		if socialsStr.Valid {
-			r.Socials = json.RawMessage(socialsStr.String)
-		} else {
-			r.Socials = json.RawMessage("{}")
-		}
-
-		restaurants = append(restaurants, r)
-	}
-
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating over restaurant rows: %w", err)
-	}
-
-	return restaurants, nil
-}
-
-// searchRestaurantsFallback uses a simpler but more reliable query
-func (d *DuckDBService) searchRestaurantsFallback(req models.SearchRequest) ([]models.Restaurant, error) {
-	limit := req.Limit
-	if limit <= 0 || limit > 100 {
-		limit = 10
-	}
-
-	// Fallback query with better bbox filtering and no complex spatial functions
-	query := `
-		SELECT
-			id,
-			names.primary as name,
-			confidence,
-			CAST(socials AS JSON) as socials,
-			ST_AsText(geometry) as geometry
-		FROM (
-			SELECT * FROM read_parquet('s3://overturemaps-us-west-2/release/2026-02-18.0/theme=places/type=place/*',
-				filename=true, hive_partitioning=1)
-			WHERE categories.primary = $1
-				AND bbox.xmin BETWEEN $2 - 0.1 AND $3 + 0.1
-				AND bbox.ymin BETWEEN $4 - 0.1 AND $5 + 0.1
-				AND bbox.xmax BETWEEN $2 - 0.1 AND $3 + 0.1  
-				AND bbox.ymax BETWEEN $4 - 0.1 AND $5 + 0.1
-		)
-		WHERE ST_Intersects(
-			geometry,
-			ST_GeomFromText('POLYGON((' || $2 || ' ' || $4 || ',' || $3 || ' ' || $4 || ',' || $3 || ' ' || $5 || ',' || $2 || ' ' || $5 || ',' || $2 || ' ' || $4 || '))', 4326)
-		)
-		ORDER BY confidence DESC
-		LIMIT $6`
-
-	rows, err := d.db.Query(query, req.Category, req.BboxMinX, req.BboxMaxX, req.BboxMinY, req.BboxMaxY, limit)
-	if err != nil {
-		return nil, fmt.Errorf("fallback query failed: %w", err)
-	}
-	defer rows.Close()
-
-	var restaurants []models.Restaurant
-	for rows.Next() {
-		var r models.Restaurant
-		var socialsStr sql.NullString
-
-		err := rows.Scan(&r.ID, &r.Name, &r.Confidence, &socialsStr, &r.Geometry)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan restaurant row: %w", err)
-		}
-
-		if socialsStr.Valid {
-			r.Socials = json.RawMessage(socialsStr.String)
-		} else {
-			r.Socials = json.RawMessage("{}")
-		}
-
-		restaurants = append(restaurants, r)
-	}
-
-	if err = rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating over restaurant rows: %w", err)
-	}
-
-	return restaurants, nil
-}
-
-// SearchRestaurantsUltraFast uses the most optimized query possible
-func (d *DuckDBService) SearchRestaurantsUltraFast(req models.SearchRequest) ([]models.Restaurant, error) {
-	// Initialize spatial extension for real queries
 	if err := d.initializeSpatial(); err != nil {
 		return nil, fmt.Errorf("failed to initialize spatial extension: %w", err)
 	}
@@ -254,41 +103,25 @@ func (d *DuckDBService) SearchRestaurantsUltraFast(req models.SearchRequest) ([]
 		limit = 10
 	}
 
-	// Ultra-optimized query using specific partitions and better filtering
-	query := `
+	// Use configured source parquet path (d.sourceparquet) instead of hardcoded filename
+	query := fmt.Sprintf(`
 		SELECT
 			id,
 			names.primary as name,
 			confidence,
-			CAST(socials AS JSON) as socials,
-			ST_AsText(geometry) as geometry
+			CAST(TO_JSON(socials) AS VARCHAR) as socials,
+			ST_AsText(TRY_CAST(geometry AS GEOMETRY)) as geometry
 		FROM
-			read_parquet('s3://overturemaps-us-west-2/release/2026-02-18.0/theme=places/type=place/*',
-				filename=true, 
-				hive_partitioning=1,
-				file_row_number=true
-			)
+			read_parquet('%s')
 		WHERE
-			categories.primary = $1
-			AND (
-				(bbox.xmin BETWEEN $2 AND $3) OR 
-				(bbox.xmax BETWEEN $2 AND $3) OR
-				(bbox.xmin <= $2 AND bbox.xmax >= $3)
-			)
-			AND (
-				(bbox.ymin BETWEEN $4 AND $5) OR 
-				(bbox.ymax BETWEEN $4 AND $5) OR
-				(bbox.ymin <= $4 AND bbox.ymax >= $5)
-			)
-			AND confidence > 0.5
-		ORDER BY 
-			confidence DESC,
-			CASE WHEN names.primary IS NOT NULL THEN 0 ELSE 1 END
-		LIMIT $6`
+			categories.primary = ?
+			AND bbox.xmin BETWEEN ? AND ?
+			AND bbox.ymin BETWEEN ? AND ?
+		LIMIT ?`, d.sourceparquet)
 
 	rows, err := d.db.Query(query, req.Category, req.BboxMinX, req.BboxMaxX, req.BboxMinY, req.BboxMaxY, limit)
 	if err != nil {
-		return nil, fmt.Errorf("ultra-fast query failed: %w", err)
+		return nil, fmt.Errorf("failed to query restaurants: %w", err)
 	}
 	defer rows.Close()
 
@@ -317,6 +150,7 @@ func (d *DuckDBService) SearchRestaurantsUltraFast(req models.SearchRequest) ([]
 
 	return restaurants, nil
 }
+
 func (d *DuckDBService) GetSamplePizzaRestaurants() []models.Restaurant {
 	return []models.Restaurant{
 		{
@@ -438,51 +272,62 @@ func (d *DuckDBService) PreprocessChunk(req models.PreprocessRequest) (*models.P
 	// Query to extract data for the specified chunk - OPTIMIZED for speed
 	log.Println("📊 Preparing optimized query for Overture dataset...")
 
-	// Calculate area to determine if we need to break this into smaller chunks
-	area = (req.BboxMaxX - req.BboxMinX) * (req.BboxMaxY - req.BboxMinY)
-	log.Printf("📏 Bounding box area: %.6f degrees² (larger areas take longer)", area)
-
-	if area > 1.0 {
-		log.Printf("⚠️  Large area detected! This will take significant time.")
-		log.Printf("💡 Consider using smaller bounding boxes (< 1.0 degrees²) for faster results")
-	}
-
 	// Use a more efficient query with better filtering
-	query := `
+	var query string
+	var queryArgs []interface{}
+	if strings.TrimSpace(req.Category) == "" {
+		// No category: preprocess all places within bbox; use configured source parquet
+		query = fmt.Sprintf(`
 		SELECT 
-			id,
-			names.primary as name,
-			confidence,
-			socials,
-			ST_AsText(geometry) as geometry
+		id,
+		names.primary as name,
+		confidence,
+		CAST(TO_JSON(socials) AS VARCHAR) as socials,
+		ST_AsText(TRY_CAST(geometry AS GEOMETRY)) as geometry
 		FROM 
-			read_parquet('s3://overturemaps-us-west-2/release/2026-02-18.0/theme=places/type=place/*', 
-						 hive_partitioning=1,
-						 filename=true) 
-		WHERE 
-			categories.primary = ? 
-			AND confidence > 0.7
-			AND names.primary IS NOT NULL
-			AND bbox.xmin >= ? AND bbox.xmin <= ?
-			AND bbox.ymin >= ? AND bbox.ymin <= ?
-			AND (bbox.xmax - bbox.xmin) < 0.1
-			AND (bbox.ymax - bbox.ymin) < 0.1
+		read_parquet('%s')
+		WHERE  
+		confidence > 0.7
+		AND names.primary IS NOT NULL
+		AND bbox.xmin >= ? AND bbox.xmax <= ?
+		AND bbox.ymin >= ? AND bbox.ymax <= ?
 		ORDER BY confidence DESC
 		LIMIT 1000
-	`
+		`, d.sourceparquet)
+		queryArgs = []interface{}{req.BboxMinX, req.BboxMaxX, req.BboxMinY, req.BboxMaxY}
+	} else {
+		query = fmt.Sprintf(`
+		SELECT 
+		id,
+		names.primary as name,
+		confidence,
+		CAST(TO_JSON(socials) AS VARCHAR) as socials,
+		ST_AsText(TRY_CAST(geometry AS GEOMETRY)) as geometry
+		FROM 
+		read_parquet('%s')
+		WHERE 
+		categories.primary = ? 
+		AND confidence > 0.7
+		AND names.primary IS NOT NULL
+		AND bbox.xmin >= ? AND bbox.xmax <= ?
+		AND bbox.ymin >= ? AND bbox.ymax <= ?
+		ORDER BY confidence DESC
+		LIMIT 1000
+		`, d.sourceparquet)
+		queryArgs = []interface{}{req.Category, req.BboxMinX, req.BboxMaxX, req.BboxMinY, req.BboxMaxY}
+	}
 
 	log.Printf("🔍 Executing optimized query against Overture dataset...")
-	log.Printf("   Category: %s (filtered for confidence > 0.7)", req.Category)
+	log.Printf("   Category: %s", req.Category)
 	log.Printf("   Bounding box: xmin=%.6f, xmax=%.6f, ymin=%.6f, ymax=%.6f",
 		req.BboxMinX, req.BboxMaxX, req.BboxMinY, req.BboxMaxY)
 	log.Printf("   Limit: 1000 records (prevents excessive data transfer)")
 
-	// Start a progress monitor goroutine with timeout
+	// Start a progress monitor goroutine with timeout (monitor only — timeout handled in wait below)
 	done := make(chan bool)
-	timeout := make(chan bool)
 
 	go func() {
-		ticker := time.NewTicker(5 * time.Second) // Check every 5 seconds
+		ticker := time.NewTicker(10 * time.Second) // Check every 10 seconds
 		defer ticker.Stop()
 		elapsed := 0
 		for {
@@ -490,22 +335,8 @@ func (d *DuckDBService) PreprocessChunk(req models.PreprocessRequest) (*models.P
 			case <-done:
 				return
 			case <-ticker.C:
-				elapsed += 5
+				elapsed += 10
 				log.Printf("⏱️  Query still running... %d seconds elapsed", elapsed)
-				if elapsed == 30 {
-					log.Printf("   Large geographic areas can take 1-2 minutes")
-				}
-				if elapsed == 60 {
-					log.Printf("   Still processing... Consider using smaller bounding boxes")
-				}
-				if elapsed >= 120 {
-					log.Printf("   Query taking very long, but this can happen with large areas")
-				}
-				if elapsed >= 300 { // 5 minutes timeout
-					log.Printf("❌ Query timeout after 5 minutes - area too large")
-					timeout <- true
-					return
-				}
 			}
 		}
 	}()
@@ -520,7 +351,7 @@ func (d *DuckDBService) PreprocessChunk(req models.PreprocessRequest) (*models.P
 
 	// Run query in goroutine
 	go func() {
-		rows, err := d.db.Query(query, req.Category, req.BboxMinX, req.BboxMaxX, req.BboxMinY, req.BboxMaxY)
+		rows, err := d.db.Query(query, queryArgs...)
 		resultChan <- struct {
 			rows *sql.Rows
 			err  error
@@ -535,8 +366,8 @@ func (d *DuckDBService) PreprocessChunk(req models.PreprocessRequest) (*models.P
 	case result := <-resultChan:
 		rows, err = result.rows, result.err
 		done <- true // Stop the progress monitor
-	case <-timeout:
-		return nil, fmt.Errorf("query timeout after 5 minutes - bounding box area too large (%.6f degrees²). Try using smaller areas", area)
+	case <-time.After(10 * time.Minute):
+		return nil, fmt.Errorf("query timeout after 10 minutes - bounding box area too large (%.6f degrees²). Try using smaller areas", area)
 	}
 
 	if err != nil {
@@ -554,23 +385,18 @@ func (d *DuckDBService) PreprocessChunk(req models.PreprocessRequest) (*models.P
 
 	for rows.Next() {
 		var restaurant models.Restaurant
-		var socialsStr string
+		var socialsStr sql.NullString
 
-		err := rows.Scan(
-			&restaurant.ID,
-			&restaurant.Name,
-			&restaurant.Confidence,
-			&socialsStr,
-			&restaurant.Geometry,
-		)
+		err := rows.Scan(&restaurant.ID, &restaurant.Name, &restaurant.Confidence, &socialsStr, &restaurant.Geometry)
+
 		if err != nil {
 			log.Printf("⚠️  Error scanning row %d: %v", rowCount+1, err)
 			continue
 		}
 
 		// Parse socials JSON
-		if socialsStr != "" {
-			restaurant.Socials = json.RawMessage(socialsStr)
+		if socialsStr.Valid && socialsStr.String != "" {
+			restaurant.Socials = json.RawMessage(socialsStr.String)
 		} else {
 			restaurant.Socials = json.RawMessage("{}")
 		}
@@ -588,7 +414,7 @@ func (d *DuckDBService) PreprocessChunk(req models.PreprocessRequest) (*models.P
 	log.Printf("✅ Finished processing %d records in %.2f seconds", len(restaurants), processingDuration.Seconds())
 
 	if len(restaurants) == 0 {
-		log.Printf("⚠️  No restaurants found for the specified criteria")
+		log.Printf("⚠️  No places found for the specified criteria")
 		log.Printf("   This might mean:")
 		log.Printf("   - No data exists in this bounding box")
 		log.Printf("   - Category '%s' doesn't match any records", req.Category)
@@ -714,16 +540,107 @@ func (d *DuckDBService) SearchFromChunk(chunkID string, limit int) ([]models.Res
 	return restaurants, nil
 }
 
+// GetChunkMetadata reads the chunk JSON metadata (always reads the JSON file written by saveChunk)
+// and returns the parsed metadata. This avoids relying on parquet reads to obtain bbox/category.
+func (d *DuckDBService) GetChunkMetadata(chunkID string) (*struct {
+	ChunkID   string  `json:"chunk_id"`
+	Category  string  `json:"category"`
+	BboxMinX  float64 `json:"bbox_min_x"`
+	BboxMaxX  float64 `json:"bbox_max_x"`
+	BboxMinY  float64 `json:"bbox_min_y"`
+	BboxMaxY  float64 `json:"bbox_max_y"`
+	CreatedAt string  `json:"created_at"`
+}, error) {
+	jsonPath := filepath.Join(d.chunksDir, chunkID+".json")
+	data, err := os.ReadFile(jsonPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read chunk metadata json: %w", err)
+	}
+
+	var meta struct {
+		ChunkID   string  `json:"chunk_id"`
+		Category  string  `json:"category"`
+		BboxMinX  float64 `json:"bbox_min_x"`
+		BboxMaxX  float64 `json:"bbox_max_x"`
+		BboxMinY  float64 `json:"bbox_min_y"`
+		BboxMaxY  float64 `json:"bbox_max_y"`
+		CreatedAt string  `json:"created_at"`
+	}
+
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal chunk metadata json: %w", err)
+	}
+
+	return &meta, nil
+}
+
+// SearchParquetChunk executes a spatial search directly against a local parquet chunk for best performance.
+// It requires a parquet file to exist (created by saveChunk). If parquet or spatial functions are unavailable
+// it returns an error so callers can fallback to the in-memory JSON search.
+func (d *DuckDBService) SearchParquetChunk(chunkID string, xmin, ymin, xmax, ymax float64, limit int) ([]models.Restaurant, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+
+	parquetPath := filepath.Join(d.chunksDir, chunkID+".parquet")
+	if _, err := os.Stat(parquetPath); err != nil {
+		return nil, fmt.Errorf("parquet not found for chunk %s: %w", chunkID, err)
+	}
+
+	// Ensure spatial extension loaded
+	if err := d.initializeSpatial(); err != nil {
+		return nil, fmt.Errorf("failed to initialize spatial extension: %w", err)
+	}
+
+	absParquet, _ := filepath.Abs(parquetPath)
+	// Use ST_MakeEnvelope for bbox intersection
+	query := fmt.Sprintf("SELECT id, name, confidence, CAST(TO_JSON(socials) AS VARCHAR) as socials, ST_AsText(ST_GeomFromWKB(CAST(geometry AS BLOB))) as geometry FROM read_parquet('%s') WHERE ST_Intersects(ST_GeomFromWKB(CAST(geometry AS BLOB)), ST_MakeEnvelope(%f, %f, %f, %f)) ORDER BY confidence DESC LIMIT %d", absParquet, xmin, ymin, xmax, ymax, limit)
+
+	rows, err := d.db.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query parquet chunk: %w", err)
+	}
+	defer rows.Close()
+
+	var results []models.Restaurant
+	for rows.Next() {
+		var r models.Restaurant
+		var socials sql.NullString
+		if err := rows.Scan(&r.ID, &r.Name, &r.Confidence, &socials, &r.Geometry); err != nil {
+			log.Printf("warning: failed to scan parquet search row: %v", err)
+			continue
+		}
+		if socials.Valid {
+			r.Socials = json.RawMessage(socials.String)
+		} else {
+			r.Socials = json.RawMessage("{}")
+		}
+		results = append(results, r)
+	}
+
+	if err := rows.Err(); err != nil {
+		return results, fmt.Errorf("error iterating parquet rows: %w", err)
+	}
+
+	return results, nil
+}
+
 // generateChunkID creates a unique identifier for a chunk based on its parameters
 func (d *DuckDBService) generateChunkID(req models.PreprocessRequest) string {
-	data := fmt.Sprintf("%s_%.6f_%.6f_%.6f_%.6f",
-		req.Category, req.BboxMinX, req.BboxMaxX, req.BboxMinY, req.BboxMaxY)
+	var data string
+	if strings.TrimSpace(req.Category) == "" {
+		data = fmt.Sprintf("bbox_%.6f_%.6f_%.6f_%.6f",
+			req.BboxMinX, req.BboxMaxX, req.BboxMinY, req.BboxMaxY)
+	} else {
+		data = fmt.Sprintf("%s_%.6f_%.6f_%.6f_%.6f",
+			req.Category, req.BboxMinX, req.BboxMaxX, req.BboxMinY, req.BboxMaxY)
+	}
 
 	hash := sha256.Sum256([]byte(data))
 	return fmt.Sprintf("%x", hash)[:16] // Use first 16 characters of hash
 }
 
-// saveChunk saves chunk data to a local file
+// saveChunk saves chunk data to a local file and writes a GeoParquet for faster reads
 func (d *DuckDBService) saveChunk(chunkID string, req models.PreprocessRequest, restaurants []models.Restaurant) error {
 	chunkData := struct {
 		ChunkID     string              `json:"chunk_id"`
@@ -751,10 +668,66 @@ func (d *DuckDBService) saveChunk(chunkID string, req models.PreprocessRequest, 
 		return fmt.Errorf("failed to marshal chunk data: %w", err)
 	}
 
-	return os.WriteFile(chunkPath, data, 0644)
+	if err := os.WriteFile(chunkPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write chunk json file: %w", err)
+	}
+
+	// Also write a GeoParquet for faster reads. We'll create a temporary CSV and use DuckDB's COPY to write Parquet with geometry.
+	csvPath := filepath.Join(d.chunksDir, chunkID+".csv")
+	parquetPath := filepath.Join(d.chunksDir, chunkID+".parquet")
+
+	csvFile, err := os.Create(csvPath)
+	if err != nil {
+		return fmt.Errorf("failed to create temp csv file: %w", err)
+	}
+	defer csvFile.Close()
+
+	writer := csv.NewWriter(csvFile)
+	// header
+	if err := writer.Write([]string{"id", "name", "confidence", "socials", "geometry"}); err != nil {
+		return fmt.Errorf("failed to write csv header: %w", err)
+	}
+
+	for _, r := range restaurants {
+		// socials is json.RawMessage -> convert to string
+		socialsStr := string(r.Socials)
+		record := []string{r.ID, r.Name, fmt.Sprintf("%f", r.Confidence), socialsStr, r.Geometry}
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("failed to write csv record: %w", err)
+		}
+	}
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return fmt.Errorf("csv writer error: %w", err)
+	}
+
+	// Ensure spatial extension loaded for ST_GeomFromText
+	if err := d.initializeSpatial(); err != nil {
+		// Not fatal for saving parquet, but log and continue
+		log.Printf("warning: failed to initialize spatial extension for parquet write: %v", err)
+	}
+
+	// Use DuckDB to convert CSV -> Parquet (geometry as geometry type)
+	// COPY (SELECT id, name, confidence, socials, ST_GeomFromText(geometry) AS geometry FROM read_csv_auto('...')) TO '...' (FORMAT PARQUET)
+	absCSV, _ := filepath.Abs(csvPath)
+	absParquet, _ := filepath.Abs(parquetPath)
+	copyQuery := fmt.Sprintf("COPY (SELECT id, name, confidence, socials, ST_GeomFromText(geometry) AS geometry FROM read_csv_auto('%s', header=TRUE)) TO '%s' (FORMAT PARQUET)", absCSV, absParquet)
+
+	if _, err := d.db.Exec(copyQuery); err != nil {
+		// If parquet write fails, log but return original error only if needed
+		log.Printf("warning: failed to write parquet for chunk %s: %v", chunkID, err)
+		// attempt cleanup of csv and continue
+		_ = os.Remove(csvPath)
+		return nil // still consider success because JSON was written
+	}
+
+	// remove tmp csv
+	_ = os.Remove(csvPath)
+
+	return nil
 }
 
-// loadChunk loads chunk data from a local file
+// loadChunk loads chunk data from a local parquet file if available, otherwise falls back to JSON
 func (d *DuckDBService) loadChunk(chunkID string) (*struct {
 	ChunkID     string              `json:"chunk_id"`
 	Category    string              `json:"category"`
@@ -765,9 +738,64 @@ func (d *DuckDBService) loadChunk(chunkID string) (*struct {
 	CreatedAt   string              `json:"created_at"`
 	Restaurants []models.Restaurant `json:"restaurants"`
 }, error) {
-	chunkPath := filepath.Join(d.chunksDir, chunkID+".json")
+	parquetPath := filepath.Join(d.chunksDir, chunkID+".parquet")
+	jsonPath := filepath.Join(d.chunksDir, chunkID+".json")
 
-	data, err := os.ReadFile(chunkPath)
+	// If parquet exists, read from it using DuckDB for faster, typed reads
+	if _, err := os.Stat(parquetPath); err == nil {
+		// Ensure spatial extension is loaded
+		if err := d.initializeSpatial(); err != nil {
+			log.Printf("warning: failed to initialize spatial extension when loading parquet: %v", err)
+		}
+
+		absParquet, _ := filepath.Abs(parquetPath)
+		query := fmt.Sprintf("SELECT id, name, confidence, CAST(TO_JSON(socials) AS VARCHAR) as socials, ST_AsText(ST_GeomFromWKB(CAST(geometry AS BLOB))) as geometry FROM read_parquet('%s')\n", absParquet)
+		rows, err := d.db.Query(query)
+		if err != nil {
+			log.Printf("failed to read parquet %s: %v", parquetPath, err)
+			// Fall back to JSON below
+		} else {
+			defer rows.Close()
+			var chunkData struct {
+				ChunkID     string              `json:"chunk_id"`
+				Category    string              `json:"category"`
+				BboxMinX    float64             `json:"bbox_min_x"`
+				BboxMaxX    float64             `json:"bbox_max_x"`
+				BboxMinY    float64             `json:"bbox_min_y"`
+				BboxMaxY    float64             `json:"bbox_max_y"`
+				CreatedAt   string              `json:"created_at"`
+				Restaurants []models.Restaurant `json:"restaurants"`
+			}
+
+			chunkData.ChunkID = chunkID
+			chunkData.Category = ""
+			chunkData.CreatedAt = ""
+
+			for rows.Next() {
+				var r models.Restaurant
+				var socialsStr sql.NullString
+				if err := rows.Scan(&r.ID, &r.Name, &r.Confidence, &socialsStr, &r.Geometry); err != nil {
+					log.Printf("warning: failed to scan parquet row: %v", err)
+					continue
+				}
+				if socialsStr.Valid {
+					r.Socials = json.RawMessage(socialsStr.String)
+				} else {
+					r.Socials = json.RawMessage("{}")
+				}
+				chunkData.Restaurants = append(chunkData.Restaurants, r)
+			}
+
+			if err := rows.Err(); err != nil {
+				log.Printf("warning: error iterating parquet rows: %v", err)
+			}
+
+			return &chunkData, nil
+		}
+	}
+
+	// Fallback to JSON file if parquet missing or failed
+	data, err := os.ReadFile(jsonPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read chunk file: %w", err)
 	}
@@ -788,6 +816,94 @@ func (d *DuckDBService) loadChunk(chunkID string) (*struct {
 	}
 
 	return &chunkData, nil
+}
+
+// ExportChunkAsGeoJSON converts a stored chunk into a GeoJSON FeatureCollection and returns the bytes.
+// This prefers the parquet-backed fast path (via loadChunk) and marshals to GeoJSON in Go.
+func (d *DuckDBService) ExportChunkAsGeoJSON(chunkID string) ([]byte, error) {
+	chunkData, err := d.loadChunk(chunkID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load chunk %s: %w", chunkID, err)
+	}
+
+	// Build GeoJSON FeatureCollection
+	type feature struct {
+		Type       string                 `json:"type"`
+		Properties map[string]interface{} `json:"properties"`
+		Geometry   interface{}            `json:"geometry"`
+	}
+
+	fc := map[string]interface{}{
+		"type":     "FeatureCollection",
+		"features": make([]feature, 0, len(chunkData.Restaurants)),
+	}
+
+	for _, r := range chunkData.Restaurants {
+		geom := parseWKTToGeoJSON(r.Geometry)
+		props := map[string]interface{}{
+			"id":         r.ID,
+			"name":       r.Name,
+			"confidence": r.Confidence,
+		}
+		// include socials if non-empty
+		if len(r.Socials) > 0 {
+			var socials interface{}
+			if err := json.Unmarshal(r.Socials, &socials); err == nil {
+				props["socials"] = socials
+			} else {
+				props["socials"] = string(r.Socials)
+			}
+		}
+
+		f := feature{
+			Type:       "Feature",
+			Properties: props,
+			Geometry:   geom,
+		}
+		fc["features"] = append(fc["features"].([]feature), f)
+	}
+
+	out, err := json.MarshalIndent(fc, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal geojson: %w", err)
+	}
+
+	return out, nil
+}
+
+// parseWKTToGeoJSON supports a minimal WKT -> GeoJSON conversion for POINT geometries.
+// Returns nil if geometry cannot be parsed.
+func parseWKTToGeoJSON(wkt string) interface{} {
+	w := strings.TrimSpace(wkt)
+	if w == "" {
+		return nil
+	}
+	// Keep original casing when extracting numbers; but check prefix case-insensitively
+	upper := strings.ToUpper(w)
+	if strings.HasPrefix(upper, "POINT(") && strings.HasSuffix(upper, ")") {
+		// extract between first '(' and last ')'
+		start := strings.Index(w, "(")
+		end := strings.LastIndex(w, ")")
+		if start == -1 || end == -1 || end <= start+1 {
+			return nil
+		}
+		inside := strings.TrimSpace(w[start+1 : end])
+		parts := strings.FieldsFunc(inside, func(r rune) bool { return r == ' ' || r == ',' })
+		if len(parts) >= 2 {
+			lonStr := strings.TrimSpace(parts[0])
+			latStr := strings.TrimSpace(parts[1])
+			lon, err1 := strconv.ParseFloat(lonStr, 64)
+			lat, err2 := strconv.ParseFloat(latStr, 64)
+			if err1 == nil && err2 == nil {
+				return map[string]interface{}{
+					"type":        "Point",
+					"coordinates": []float64{lon, lat},
+				}
+			}
+		}
+	}
+	// unsupported or invalid geometry -> return nil
+	return nil
 }
 
 // suggestSmallerBboxes breaks a large bounding box into smaller, more manageable chunks
