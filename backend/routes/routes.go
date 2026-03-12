@@ -1,41 +1,29 @@
 package routes
 
 import (
-	"time"
-
 	"examle.com/mod/handlers"
-	"examle.com/mod/services"
-	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 )
 
-// SetupRoutes configures all API routes
-func SetupRoutes(duckdbService *services.DuckDBService) *gin.Engine {
-	r := gin.Default()
-
-	// Configure CORS middleware
-	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:3000", "http://localhost:5173", "http://localhost:5174", "http://localhost:8080"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With"},
-		ExposeHeaders:    []string{"Content-Length"},
-		AllowCredentials: true,
-		MaxAge:           12 * time.Hour,
-	}))
-
-	restaurantHandler := handlers.NewRestaurantHandler(duckdbService)
-
-	r.GET("/health", restaurantHandler.Health)
-
+// Register mounts all API routes onto the provided engine.
+func Register(r *gin.Engine) {
 	v1 := r.Group("/api/v1")
 	{
-		v1.POST("/search", restaurantHandler.Search)
-		v1.POST("/search-real", restaurantHandler.SearchReal)
-		v1.POST("/preprocess", restaurantHandler.PreprocessChunk)
-		v1.GET("/chunks", restaurantHandler.GetAvailableChunks)
-		v1.POST("/search-chunk/:chunkId", restaurantHandler.SearchChunk)
-		v1.GET("/chunks/:chunkId/geojson", restaurantHandler.GetChunkGeoJSON)
-	}
+		// GET /api/v1/list-files/*url
+		// Lists immediate children of an S3 bucket/prefix.
+		// Examples:
+		//   /api/v1/list-files/overturemaps-us-west-2/release
+		//   /api/v1/list-files/s3://overturemaps-us-west-2/release
+		v1.GET("/list-files/*url", handlers.ListS3Files)
 
-	return r
+		// GET /api/v1/spatial-data?path=<s3-or-local>&k=<rows>&region=<aws-region>
+		// Reads k rows from a Parquet file via DuckDB.
+		// Geometry columns are returned as WKT strings.
+		v1.GET("/spatial-data", handlers.GetSpatialData)
+
+		// POST /api/v1/index-file
+		// Accepts an S3 path (file or folder) and an optional row-count limit,
+		// then kicks off asynchronous indexing of the target Parquet data.
+		v1.POST("/index-file", handlers.IndexFile)
+	}
 }
