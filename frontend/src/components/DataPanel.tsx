@@ -3,8 +3,15 @@ import type { SelectedFile } from './S3Explorer'
 
 const API = 'http://localhost:3001/api/v1'
 
+export interface GeoJSONGeometry {
+  type: string
+  coordinates: unknown
+}
+
+export type Geometry = string | GeoJSONGeometry
+
 export interface SpatialFeature {
-  geometry: string
+  geometry: Geometry
   properties: Record<string, unknown>
 }
 
@@ -197,9 +204,13 @@ export default function DataPanel({ selectedFile, onOpenS3Browser, onFeaturesCha
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function wktGeomType(wkt: string): string {
-  if (!wkt) return 'unknown'
-  const m = wkt.match(/^(\w+)/i)
+function wktGeomType(geometry: Geometry): string {
+  if (!geometry) return 'unknown'
+  if (typeof geometry !== 'string') {
+    const type = geometry.type
+    return typeof type === 'string' && type ? type.toLowerCase() : 'unknown'
+  }
+  const m = geometry.match(/^(\w+)/i)
   return m ? m[1].toLowerCase() : 'unknown'
 }
 

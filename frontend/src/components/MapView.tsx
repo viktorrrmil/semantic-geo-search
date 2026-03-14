@@ -2,9 +2,9 @@ import {useState, useRef, useEffect, useMemo} from 'react'
 import DeckGL from '@deck.gl/react'
 import {TileLayer} from '@deck.gl/geo-layers'
 import {BitmapLayer, PolygonLayer, ScatterplotLayer, PathLayer} from '@deck.gl/layers'
-import {WebMercatorViewport} from '@deck.gl/core'
+import {FlyToInterpolator, WebMercatorViewport} from '@deck.gl/core'
 import type {MapViewState, PickingInfo} from '@deck.gl/core'
-import type {SpatialFeature} from './DataPanel'
+import type {GeoJSONGeometry, Geometry, SpatialFeature} from './DataPanel'
 
 export interface BBox {
     minX: number
@@ -35,6 +35,8 @@ interface Props {
     selectionBBox?: BBox | null
     onSelectionChange?: (bbox: BBox | null) => void
     drawMode?: 'none' | 'shift' | 'always'
+    focusedFeature?: SpatialFeature | null
+    baseMap?: 'osm' | 'satellite'
 }
 
 const INITIAL_VIEW_STATE: MapViewState = {
@@ -52,21 +54,44 @@ const WORLD_RING: [number, number][] = [
     [-180, 85],
 ]
 
-const OSM_LAYER = new TileLayer({
-    id: 'osm',
-    data: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-    maxZoom: 19,
-    minZoom: 0,
-    tileSize: 256,
-    renderSubLayers: (props) => {
-        const {boundingBox} = props.tile
-        return new BitmapLayer(props, {
-            data: undefined,
-            image: props.data,
-            bounds: [boundingBox[0][0], boundingBox[0][1], boundingBox[1][0], boundingBox[1][1]],
-        })
-    },
-})
+const WORLD_BOUNDS: [number, number, number, number] = [-180, -85, 180, 85]
+
+function clamp(value: number, min: number, max: number) {
+    return Math.min(max, Math.max(min, value))
+}
+
+function clampViewState(vs: MapViewState): MapViewState {
+    const [minLng, minLat, maxLng, maxLat] = WORLD_BOUNDS
+    return {
+        ...vs,
+        longitude: clamp(vs.longitude, minLng, maxLng),
+        latitude: clamp(vs.latitude, minLat, maxLat),
+    }
+}
+
+function createTileLayer(id: string, url: string) {
+    return new TileLayer({
+        id,
+        data: url,
+        maxZoom: 19,
+        minZoom: 0,
+        tileSize: 256,
+        renderSubLayers: (props) => {
+            const {boundingBox} = props.tile
+            return new BitmapLayer(props, {
+                data: undefined,
+                image: props.data,
+                bounds: [boundingBox[0][0], boundingBox[0][1], boundingBox[1][0], boundingBox[1][1]],
+            })
+        },
+    })
+}
+
+const OSM_LAYER = createTileLayer('osm', 'https://tile.openstreetmap.org/{z}/{x}/{y}.png')
+const SATELLITE_LAYER = createTileLayer(
+    'satellite',
+    'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+)
 
 // ── WKT parsing ───────────────────────────────────────────────────────────────
 
@@ -92,12 +117,44 @@ function innerRings(wkt: string): string[] {
     return groups
 }
 
+function normalizeWkt(wkt: string): string {
+    const trimmed = wkt.trim()
+    return trimmed.replace(/^SRID=\d+;/i, '').trim()
+}
+
+function isGeoJSONGeometry(geometry: Geometry): geometry is GeoJSONGeometry {
+    return typeof geometry === 'object' && geometry !== null
+        && 'type' in geometry && typeof (geometry as GeoJSONGeometry).type === 'string'
+        && 'coordinates' in geometry
+}
+
+function collectCoords(value: unknown, out: [number, number][]) {
+    if (!Array.isArray(value)) return
+    if (value.length >= 2 && typeof value[0] === 'number' && typeof value[1] === 'number') {
+        out.push([value[0], value[1]])
+        return
+    }
+    for (const item of value) collectCoords(item, out)
+}
+
+function extractCoords(geometry: Geometry): [number, number][] {
+    if (typeof geometry === 'string') {
+        return parseCoords(normalizeWkt(geometry))
+    }
+    if (isGeoJSONGeometry(geometry)) {
+        const out: [number, number][] = []
+        collectCoords(geometry.coordinates, out)
+        return out
+    }
+    return []
+}
+
 /** Compute a bounding box that contains all feature geometries */
 function featuresBbox(features: SpatialFeature[]): [[number, number], [number, number]] | null {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
     let any = false
     for (const f of features) {
-        const all = parseCoords(f.geometry)
+        const all = extractCoords(f.geometry)
         for (const [x, y] of all) {
             if (x < minX) minX = x;
             if (x > maxX) maxX = x
@@ -107,6 +164,19 @@ function featuresBbox(features: SpatialFeature[]): [[number, number], [number, n
         }
     }
     return any ? [[minX, minY], [maxX, maxY]] : null
+}
+
+function featureBbox(feature: SpatialFeature): [[number, number], [number, number]] | null {
+    const coords = extractCoords(feature.geometry)
+    if (!coords.length) return null
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+    for (const [x, y] of coords) {
+        if (x < minX) minX = x
+        if (x > maxX) maxX = x
+        if (y < minY) minY = y
+        if (y > maxY) maxY = y
+    }
+    return [[minX, minY], [maxX, maxY]]
 }
 
 // ── Geometry categorization ───────────────────────────────────────────────────
@@ -126,13 +196,93 @@ interface PathDatum {
     feature: SpatialFeature
 }
 
+function toCoordPair(value: unknown): [number, number] | null {
+    if (!Array.isArray(value) || value.length < 2) return null
+    const [x, y] = value
+    if (typeof x === 'number' && typeof y === 'number' && isFinite(x) && isFinite(y)) {
+        return [x, y]
+    }
+    return null
+}
+
+function toCoordList(value: unknown): [number, number][] {
+    if (!Array.isArray(value)) return []
+    const coords: [number, number][] = []
+    for (const item of value) {
+        const pair = toCoordPair(item)
+        if (pair) coords.push(pair)
+    }
+    return coords
+}
+
+function addGeoJSONGeometry(
+    geometry: GeoJSONGeometry,
+    feature: SpatialFeature,
+    points: PointDatum[],
+    polys: PolyDatum[],
+    paths: PathDatum[],
+) {
+    const type = geometry.type.toLowerCase()
+    const coords = geometry.coordinates
+
+    if (type === 'point') {
+        const pair = toCoordPair(coords)
+        if (pair) points.push({pos: pair, feature})
+        return
+    }
+
+    if (type === 'multipoint') {
+        for (const item of Array.isArray(coords) ? coords : []) {
+            const pair = toCoordPair(item)
+            if (pair) points.push({pos: pair, feature})
+        }
+        return
+    }
+
+    if (type === 'linestring') {
+        const path = toCoordList(coords)
+        if (path.length >= 2) paths.push({path, feature})
+        return
+    }
+
+    if (type === 'multilinestring') {
+        for (const line of Array.isArray(coords) ? coords : []) {
+            const path = toCoordList(line)
+            if (path.length >= 2) paths.push({path, feature})
+        }
+        return
+    }
+
+    if (type === 'polygon') {
+        const rings = (Array.isArray(coords) ? coords : [])
+            .map(ring => toCoordList(ring))
+            .filter(ring => ring.length >= 3)
+        if (rings.length) polys.push({rings, feature})
+        return
+    }
+
+    if (type === 'multipolygon') {
+        for (const poly of Array.isArray(coords) ? coords : []) {
+            const rings = (Array.isArray(poly) ? poly : [])
+                .map(ring => toCoordList(ring))
+                .filter(ring => ring.length >= 3)
+            if (rings.length) polys.push({rings, feature})
+        }
+    }
+}
+
 function categorize(features: SpatialFeature[]) {
     const points: PointDatum[] = []
     const polys: PolyDatum[] = []
     const paths: PathDatum[] = []
 
     for (const f of features) {
-        const g = f.geometry?.trim() ?? ''
+        const geom = f.geometry
+        if (isGeoJSONGeometry(geom)) {
+            addGeoJSONGeometry(geom, f, points, polys, paths)
+            continue
+        }
+        const g = normalizeWkt(typeof geom === 'string' ? geom : '')
         const upper = g.toUpperCase()
 
         if (upper.startsWith('POINT')) {
@@ -200,13 +350,15 @@ function resolveSubtitle(feature: SpatialFeature): string {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function MapView({
-                                    features,
-                                    indexedAreas,
-                                    dimMap = false,
-                                    selectionBBox,
-                                    onSelectionChange,
-                                    drawMode = 'none',
-                                }: Props) {
+                                     features,
+                                     indexedAreas,
+                                     dimMap = false,
+                                     selectionBBox,
+                                     onSelectionChange,
+                                     drawMode = 'none',
+                                     focusedFeature = null,
+                                     baseMap = 'osm',
+                                 }: Props) {
     const containerRef = useRef<HTMLDivElement>(null)
     const [viewState, setViewState] = useState<MapViewState>(INITIAL_VIEW_STATE)
     const vsRef = useRef<MapViewState>(INITIAL_VIEW_STATE)
@@ -246,6 +398,42 @@ export default function MapView({
         } catch { /* fitBounds can throw for degenerate bbox */
         }
     }, [safeFeatures])
+
+    // Fly to a focused feature when selected
+    useEffect(() => {
+        if (!focusedFeature || !containerRef.current) return
+        const bbox = featureBbox(focusedFeature)
+        if (!bbox) return
+        const {clientWidth: w, clientHeight: h} = containerRef.current
+        if (w === 0 || h === 0) return
+
+        try {
+            const vp = new WebMercatorViewport({width: w, height: h})
+            const [min, max] = bbox
+            const isPoint = min[0] === max[0] && min[1] === max[1]
+            let longitude = min[0]
+            let latitude = min[1]
+            let zoom = Math.max(vsRef.current.zoom, 15)
+
+            if (!isPoint) {
+                const fitted = vp.fitBounds(bbox, {padding: 80})
+                longitude = fitted.longitude
+                latitude = fitted.latitude
+                zoom = Math.min(fitted.zoom, 18)
+            }
+
+            const next = {
+                ...vsRef.current,
+                longitude,
+                latitude,
+                zoom,
+                transitionDuration: 1200,
+                transitionInterpolator: new FlyToInterpolator({speed: 1.6}),
+            }
+            vsRef.current = next
+            setViewState(next)
+        } catch { /* ignore fit errors */ }
+    }, [focusedFeature, size.width, size.height])
 
     const {points, polys, paths} = categorize(safeFeatures)
 
@@ -397,7 +585,7 @@ export default function MapView({
         : null
 
     const layers = [
-        OSM_LAYER,
+        baseMap === 'satellite' ? SATELLITE_LAYER : OSM_LAYER,
         dimLayer,
         selectionLayer,
         polysLayer,
@@ -432,7 +620,7 @@ export default function MapView({
             <DeckGL
                 viewState={viewState}
                 onViewStateChange={({viewState: vs}) => {
-                    const next = vs as MapViewState
+                    const next = clampViewState(vs as MapViewState)
                     vsRef.current = next
                     setViewState(next)
                 }}
@@ -493,19 +681,35 @@ export default function MapView({
                 </div>
             )}
 
-            {/* OSM attribution */}
+            {/* Map attribution */}
             <div
                 className="absolute bottom-2 right-2 text-[10px] text-gray-400 bg-white/80 px-1.5 py-0.5 rounded pointer-events-none">
-                ©{' '}
-                <a
-                    href="https://www.openstreetmap.org/copyright"
-                    className="underline pointer-events-auto"
-                    target="_blank"
-                    rel="noreferrer"
-                >
-                    OpenStreetMap
-                </a>{' '}
-                contributors
+                {baseMap === 'satellite' ? (
+                    <>
+                        Imagery ©{' '}
+                        <a
+                            href="https://www.esri.com/en-us/arcgis/products/arcgis-world-imagery/overview"
+                            className="underline pointer-events-auto"
+                            target="_blank"
+                            rel="noreferrer"
+                        >
+                            Esri
+                        </a>
+                    </>
+                ) : (
+                    <>
+                        ©{' '}
+                        <a
+                            href="https://www.openstreetmap.org/copyright"
+                            className="underline pointer-events-auto"
+                            target="_blank"
+                            rel="noreferrer"
+                        >
+                            OpenStreetMap
+                        </a>{' '}
+                        contributors
+                    </>
+                )}
             </div>
         </div>
     )

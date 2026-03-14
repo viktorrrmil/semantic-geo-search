@@ -1,10 +1,13 @@
-import {useState, type FormEvent} from 'react'
+import {useEffect, useRef, useState, type FormEvent} from 'react'
 import MapView, {type BBox, type IndexedArea} from './components/MapView'
 import S3Explorer, {type FileItem, type SelectedFile} from './components/S3Explorer'
-import type {SpatialFeature} from './components/DataPanel'
+import type {GeoJSONGeometry, Geometry, SpatialFeature} from './components/DataPanel'
 import './App.css'
 
 const API = 'http://localhost:3001/api/v1'
+const SEARCH_API = 'http://localhost:3001'
+const DEFAULT_TOP_K = 5
+const TOP_K_PRESETS = [5, 10, 25, 50]
 
 const HARD_CODED_AREAS: IndexedArea[] = [
     {
@@ -21,22 +24,77 @@ type Status = 'idle' | 'loading' | 'success' | 'error'
 
 interface SearchResult {
     id: string
-    name: string
-    confidence: number
-    socials?: Record<string, string> | null
-    geometry: string
+    embed_text: string
+    geom: Geometry
+    category?: string | null
+    country?: string | null
+    confidence?: number | null
+    raw?: unknown
+}
 
-    [key: string]: unknown
+function isGeoJSONGeometry(value: unknown): value is GeoJSONGeometry {
+    return typeof value === 'object' && value !== null
+        && 'type' in value && typeof (value as GeoJSONGeometry).type === 'string'
+        && 'coordinates' in value
+}
+
+function normalizeSearchResult(row: Record<string, unknown>, index: number): SearchResult {
+    const id = typeof row.id === 'string' ? row.id : (row.id != null ? String(row.id) : '')
+    const geom = typeof row.geom === 'string'
+        ? row.geom
+        : (isGeoJSONGeometry(row.geom) ? row.geom : '')
+    return {
+        id: id || `row-${index}`,
+        embed_text: typeof row.embed_text === 'string' ? row.embed_text : '',
+        geom,
+        category: typeof row.category === 'string' ? row.category : null,
+        country: typeof row.country === 'string' ? row.country : null,
+        confidence: typeof row.confidence === 'number' ? row.confidence : null,
+        raw: row.raw,
+    }
+}
+
+function toSpatialFeature(row: SearchResult): SpatialFeature {
+    const props: Record<string, unknown> = {
+        id: row.id,
+        name: row.embed_text,
+        embed_text: row.embed_text,
+    }
+    if (row.category) props.category = row.category
+    if (row.country) props.country = row.country
+    if (row.confidence != null) props.confidence = row.confidence
+    if (row.raw != null) props.raw = row.raw
+    return {
+        geometry: row.geom ?? '',
+        properties: props,
+    }
+}
+
+function resolveTopK(value: string) {
+    const parsed = parseInt(value, 10)
+    return Math.max(1, Number.isFinite(parsed) ? parsed : DEFAULT_TOP_K)
+}
+
+function formatConfidence(value: number | null | undefined) {
+    if (value == null || Number.isNaN(value)) return null
+    const pct = value <= 1 ? Math.round(value * 100) : Math.round(value)
+    return `${pct}%`
 }
 
 function App() {
     const [page, setPage] = useState<Page>('main')
     const [indexedAreas, setIndexedAreas] = useState<IndexedArea[]>(HARD_CODED_AREAS)
-    const [selectedAreaId, setSelectedAreaId] = useState<string | null>(HARD_CODED_AREAS[0]?.id ?? null)
     const [searchQuery, setSearchQuery] = useState('')
+    const [topK, setTopK] = useState(String(DEFAULT_TOP_K))
+    const [showTopKMenu, setShowTopKMenu] = useState(false)
     const [searchStatus, setSearchStatus] = useState<Status>('idle')
     const [searchError, setSearchError] = useState('')
+    const [searchResults, setSearchResults] = useState<SearchResult[]>([])
     const [searchFeatures, setSearchFeatures] = useState<SpatialFeature[]>([])
+    const [selectedResultId, setSelectedResultId] = useState<string | null>(null)
+    const [focusedFeature, setFocusedFeature] = useState<SpatialFeature | null>(null)
+    const [showIndexedOverlay, setShowIndexedOverlay] = useState(false)
+    const [showSatellite, setShowSatellite] = useState(false)
 
     const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null)
     const [selectionBBox, setSelectionBBox] = useState<BBox | null>(null)
@@ -44,45 +102,69 @@ function App() {
     const [indexStatus, setIndexStatus] = useState<Status>('idle')
     const [indexMsg, setIndexMsg] = useState('')
 
-    const activeArea = indexedAreas.find(a => a.id === selectedAreaId && a.active !== false) ?? null
+    const topKMenuRef = useRef<HTMLDivElement>(null)
+    const selectedResult = selectedResultId
+        ? searchResults.find(result => result.id === selectedResultId) ?? null
+        : null
+
+    useEffect(() => {
+        if (!showTopKMenu) return
+        const handler = (event: MouseEvent) => {
+            if (!topKMenuRef.current) return
+            if (!topKMenuRef.current.contains(event.target as Node)) {
+                setShowTopKMenu(false)
+            }
+        }
+        document.addEventListener('mousedown', handler)
+        return () => document.removeEventListener('mousedown', handler)
+    }, [showTopKMenu])
 
     async function handleSearchSubmit(e: FormEvent) {
         e.preventDefault()
         const query = searchQuery.trim()
-        if (!query || !activeArea) {
-            setSearchError('Select an indexed area and enter a search term.')
+        if (!query) {
+            setSearchError('Enter a search query to search all indexed areas.')
             setSearchStatus('error')
             return
         }
+        setShowTopKMenu(false)
         setSearchStatus('loading')
         setSearchError('')
+        setSelectedResultId(null)
+        setFocusedFeature(null)
         try {
-            const res = await fetch(`${API}/search-real`, {
+            console.log(`Searching for "${query}" with topK=${resolveTopK(topK)}...`)
+            const resolvedTopK = resolveTopK(topK)
+            const res = await fetch(`${SEARCH_API}/search`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
-                    category: query,
-                    bbox_min_x: activeArea.bbox.minX,
-                    bbox_max_x: activeArea.bbox.maxX,
-                    bbox_min_y: activeArea.bbox.minY,
-                    bbox_max_y: activeArea.bbox.maxY,
-                    limit: 50,
+                    query,
+                    count: resolvedTopK,
                 }),
             })
             if (!res.ok) throw new Error(`Server responded with ${res.status}`)
-            const data = await res.json()
-            const list: SearchResult[] = data.restaurants ?? []
-            const mapped: SpatialFeature[] = list.map(row => {
-                const {geometry, ...props} = row
-                return {
-                    geometry: typeof geometry === 'string' ? geometry : '',
-                    properties: props,
-                }
-            })
+            const data: unknown = await res.json()
+            const rows = Array.isArray(data)
+                ? data
+                : (data && typeof data === 'object' && Array.isArray((data as {results?: unknown}).results))
+                    ? (data as {results: unknown[]}).results
+                    : (data && typeof data === 'object' && Array.isArray((data as {rows?: unknown}).rows))
+                        ? (data as {rows: unknown[]}).rows
+                        : null
+            if (!rows) {
+                throw new Error('Unexpected response format')
+            }
+            const parsed = rows.map((row, index) => normalizeSearchResult(row as Record<string, unknown>, index))
+            const trimmed = parsed.slice(0, resolvedTopK)
+            const mapped = trimmed.map(toSpatialFeature)
+            console.log("Search results:", trimmed)
+            setSearchResults(trimmed)
             setSearchFeatures(mapped)
             setSearchStatus('success')
         } catch (err) {
             setSearchError(err instanceof Error ? err.message : 'Search failed')
+            setSearchResults([])
             setSearchFeatures([])
             setSearchStatus('error')
         }
@@ -91,19 +173,16 @@ function App() {
     function handleSearchClear() {
         setSearchQuery('')
         setSearchError('')
+        setSearchResults([])
         setSearchFeatures([])
+        setSelectedResultId(null)
+        setFocusedFeature(null)
+        setShowTopKMenu(false)
         setSearchStatus('idle')
     }
 
     function handleToggleArea(id: string) {
-        setIndexedAreas(prev => {
-            const next = prev.map(area => area.id === id ? {...area, active: area.active === false} : area)
-            if (selectedAreaId === id && next.find(a => a.id === id)?.active === false) {
-                const fallback = next.find(a => a.active !== false)
-                setSelectedAreaId(fallback?.id ?? null)
-            }
-            return next
-        })
+        setIndexedAreas(prev => prev.map(area => area.id === id ? {...area, active: area.active === false} : area))
     }
 
     async function handleIndexSelection() {
@@ -164,7 +243,6 @@ function App() {
                 active: true,
             }
             setIndexedAreas(prev => [...prev, newArea])
-            setSelectedAreaId(areaId)
             if (successCount < files.length) {
                 setIndexMsg(`Indexed ${successCount}/${files.length} files. Last error: ${lastError}`)
                 setIndexStatus('error')
@@ -187,7 +265,9 @@ function App() {
                     <MapView
                         features={searchFeatures}
                         indexedAreas={indexedAreas}
-                        dimMap
+                        dimMap={showIndexedOverlay}
+                        focusedFeature={focusedFeature}
+                        baseMap={showSatellite ? 'satellite' : 'osm'}
                     />
 
                     <div className="absolute top-4 right-4 z-40">
@@ -199,35 +279,17 @@ function App() {
                         </button>
                     </div>
 
-                    <div className="absolute top-4 left-4 z-40">
-                        <IndexedAreasPanel
-                            areas={indexedAreas}
-                            selectedAreaId={selectedAreaId}
-                            onSelect={id => setSelectedAreaId(id)}
-                            onToggle={handleToggleArea}
-                            onDelete={id => {
-                                setIndexedAreas(prev => {
-                                    const next = prev.filter(area => area.id !== id)
-                                    if (selectedAreaId === id) {
-                                        const fallback = next.find(area => area.active !== false)
-                                        setSelectedAreaId(fallback?.id ?? null)
-                                    }
-                                    return next
-                                })
-                            }}
-                        />
-                    </div>
-
-                    <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 w-[420px] max-w-[80vw]">
-                        <form
-                            onSubmit={handleSearchSubmit}
-                            className="flex items-center gap-2 bg-white/90 border border-gray-200 rounded-full shadow-sm px-3 py-2"
-                        >
+                    <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 max-w-[90vw]">
+                        <div className="flex items-center gap-2">
+                            <form
+                                onSubmit={handleSearchSubmit}
+                                className="flex items-center gap-2 bg-white/90 border border-gray-200 rounded-full shadow-sm px-3 py-2 w-[420px] max-w-[70vw]"
+                            >
                             <input
                                 type="text"
                                 value={searchQuery}
                                 onChange={e => setSearchQuery(e.target.value)}
-                                placeholder={activeArea ? `Search in ${activeArea.label}` : 'Select an indexed area to search'}
+                                placeholder="Search across indexed areas"
                                 className="flex-1 bg-transparent text-sm text-gray-700 placeholder-gray-400 outline-none"
                             />
                             {searchQuery && (
@@ -241,16 +303,140 @@ function App() {
                             )}
                             <button
                                 type="submit"
-                                disabled={!searchQuery.trim() || !activeArea || searchStatus === 'loading'}
+                                disabled={!searchQuery.trim() || searchStatus === 'loading'}
                                 className="text-[11px] font-medium text-white bg-gray-800 px-3 py-1.5 rounded-full hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                             >
                                 {searchStatus === 'loading' ? 'Searching…' : 'Search'}
                             </button>
-                        </form>
+                            </form>
+                            <div className="relative" ref={topKMenuRef}>
+                            <button
+                                type="button"
+                                onClick={() => setShowTopKMenu(v => !v)}
+                                className="h-9 w-9 rounded-full bg-white/90 border border-gray-200 shadow-sm text-gray-400 hover:text-gray-600 transition-colors flex items-center justify-center"
+                                aria-label="Search options"
+                                aria-expanded={showTopKMenu}
+                            >
+                                ⋯
+                            </button>
+                            <div
+                                className={`absolute right-0 mt-2 w-44 bg-white border border-gray-200 rounded-md shadow-md z-50 transition-all duration-200 origin-top-right ${
+                                    showTopKMenu
+                                        ? 'opacity-100 scale-100 translate-y-0'
+                                        : 'opacity-0 scale-95 -translate-y-1 pointer-events-none'
+                                }`}
+                            >
+                                <div className="px-3 py-2 border-b border-gray-100">
+                                    <p className="text-[10px] text-gray-400 mb-1">Top K</p>
+                                    <input
+                                        type="number"
+                                        min={1}
+                                        value={topK}
+                                        onChange={e => setTopK(e.target.value)}
+                                        className="w-full text-[11px] bg-gray-50 border border-gray-200 rounded px-2 py-1 text-gray-700 outline-none focus:border-gray-300"
+                                    />
+                                </div>
+                                <div className="p-2 flex flex-wrap gap-1.5">
+                                    {TOP_K_PRESETS.map(k => (
+                                        <button
+                                            key={k}
+                                            type="button"
+                                            onClick={() => {
+                                                setTopK(String(k))
+                                                setShowTopKMenu(false)
+                                            }}
+                                            className="text-[10px] text-gray-600 border border-gray-200 rounded px-2 py-1 hover:bg-gray-50"
+                                        >
+                                            {k}
+                                        </button>
+                                    ))}
+                                </div>
+                            </div>
+                            </div>
+                        </div>
                         {searchError && (
                             <p className="mt-2 text-[11px] text-rose-500 text-center">{searchError}</p>
                         )}
                     </div>
+                    <div className="absolute top-4 left-4 z-30 w-80 max-w-[85vw] flex flex-col gap-3">
+                        <div className="bg-white/90 border border-gray-200 rounded-lg shadow-sm flex flex-col overflow-hidden max-h-[55vh] min-h-[220px]">
+                            <div className="px-4 py-2.5 border-b border-gray-100">
+                                <p className="text-[11px] text-gray-400">Search results</p>
+                                <p className="text-xs text-gray-600">
+                                    Top {resolveTopK(topK)} results
+                                </p>
+                            </div>
+                            <div className="flex-1 overflow-y-auto min-h-0">
+                                {searchStatus === 'idle' && (
+                                    <div className="flex flex-col items-center justify-center py-10 gap-2 text-center px-6">
+                                        <div className="w-9 h-9 rounded-full border border-dashed border-gray-300 flex items-center justify-center text-gray-300 text-xl">
+                                            ⌕
+                                        </div>
+                                        <p className="text-xs text-gray-400">
+                                            Enter a query to search across all indexed areas
+                                        </p>
+                                    </div>
+                                )}
+
+                                {searchStatus === 'loading' && (
+                                    <div className="flex items-center justify-center py-10">
+                                        <div className="flex gap-1.5">
+                                            <span className="w-1.5 h-1.5 rounded-full bg-gray-300 animate-bounce [animation-delay:-0.3s]" />
+                                            <span className="w-1.5 h-1.5 rounded-full bg-gray-300 animate-bounce [animation-delay:-0.15s]" />
+                                            <span className="w-1.5 h-1.5 rounded-full bg-gray-300 animate-bounce" />
+                                        </div>
+                                    </div>
+                                )}
+
+                                {searchStatus === 'error' && (
+                                    <div className="mx-4 mt-4 px-3 py-2 bg-rose-50 border border-rose-100 rounded-md">
+                                        <p className="text-xs text-rose-500">{searchError}</p>
+                                    </div>
+                                )}
+
+                                {searchStatus === 'success' && searchResults.length === 0 && (
+                                    <div className="flex flex-col items-center justify-center py-10 gap-1 text-center px-6">
+                                        <p className="text-sm text-gray-500">No results found</p>
+                                        <p className="text-xs text-gray-400">Try a different query</p>
+                                    </div>
+                                )}
+
+                                {searchStatus === 'success' && searchResults.length > 0 && (
+                                    <ul className="p-3 space-y-2">
+                                        {searchResults.map((result, index) => (
+                                            <SearchResultRow
+                                                key={result.id}
+                                                result={result}
+                                                selected={selectedResultId === result.id}
+                                                onSelect={() => {
+                                                    setSelectedResultId(result.id)
+                                                    const feature = searchFeatures[index]
+                                                    if (feature?.geometry) {
+                                                        setFocusedFeature(feature)
+                                                    }
+                                                }}
+                                            />
+                                        ))}
+                                    </ul>
+                                )}
+                            </div>
+                        </div>
+
+                        <IndexedAreasPanel
+                            areas={indexedAreas}
+                            onToggle={handleToggleArea}
+                            onDelete={id => {
+                                setIndexedAreas(prev => prev.filter(area => area.id !== id))
+                            }}
+                            className="w-full max-h-[30vh]"
+                            overlayEnabled={showIndexedOverlay}
+                            onOverlayToggle={() => setShowIndexedOverlay(v => !v)}
+                            satelliteEnabled={showSatellite}
+                            onSatelliteToggle={() => setShowSatellite(v => !v)}
+                        />
+                    </div>
+
+                    <SelectedResultPanel result={selectedResult} />
                 </div>
             ) : (
                 <div className="flex h-full w-full overflow-hidden">
@@ -372,30 +558,146 @@ function App() {
     )
 }
 
+function SearchResultRow({
+    result,
+    selected,
+    onSelect,
+}: {
+    result: SearchResult
+    selected: boolean
+    onSelect: () => void
+}) {
+    const confidence = formatConfidence(result.confidence)
+    return (
+        <li>
+            <button
+                type="button"
+                onClick={onSelect}
+                className={`w-full text-left border rounded-md px-3 py-2.5 transition-colors ${
+                    selected ? 'border-teal-400 bg-teal-50/70' : 'border-gray-200 bg-white hover:border-gray-300'
+                }`}
+            >
+                <div className="flex items-start justify-between gap-2">
+                    <span className="text-sm text-gray-800 leading-snug truncate">
+                        {result.embed_text || result.id}
+                    </span>
+                    {confidence && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 font-medium tabular-nums">
+                            {confidence}
+                        </span>
+                    )}
+                </div>
+                {(result.category || result.country) && (
+                    <div className="mt-1 flex flex-wrap gap-2 text-[10px] text-gray-400">
+                        {result.category && <span>{result.category}</span>}
+                        {result.country && <span>{result.country}</span>}
+                    </div>
+                )}
+                <p className="mt-1 text-[10px] text-gray-300 font-mono truncate">{result.id}</p>
+            </button>
+        </li>
+    )
+}
+
+function formatDetailValue(value: unknown): string {
+    if (value === null || value === undefined) return '—'
+    if (typeof value === 'string') return value
+    if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+    if (typeof value === 'object') {
+        try {
+            return JSON.stringify(value, null, 2)
+        } catch {
+            return String(value)
+        }
+    }
+    return String(value)
+}
+
+function SelectedResultPanel({result}: { result: SearchResult | null }) {
+    if (!result) return null
+    const entries: Array<[string, unknown]> = [
+        ['id', result.id],
+        ['category', result.category],
+        ['country', result.country],
+        ['confidence', formatConfidence(result.confidence)],
+        ['geometry', result.geom],
+    ]
+    if (result.raw && typeof result.raw === 'object') {
+        for (const [key, value] of Object.entries(result.raw as Record<string, unknown>)) {
+            entries.push([key, value])
+        }
+    }
+    return (
+        <div className="absolute top-20 right-4 z-30 w-80 max-w-[85vw] bg-white/95 border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+            <div className="px-4 py-3 border-b border-gray-100">
+                <p className="text-[11px] text-gray-400">Selected result</p>
+                <p className="text-sm text-gray-700 mt-1 leading-snug">{result.embed_text || result.id}</p>
+            </div>
+            <div className="px-4 py-3 space-y-2 max-h-[60vh] overflow-y-auto">
+                {entries.map(([key, value]) => (
+                    <div key={key} className="text-[11px] text-gray-500">
+                        <p className="uppercase tracking-wide text-[9px] text-gray-400">{key}</p>
+                        <pre className="whitespace-pre-wrap break-words text-gray-700">{formatDetailValue(value)}</pre>
+                    </div>
+                ))}
+            </div>
+        </div>
+    )
+}
+
 function IndexedAreasPanel({
-                               areas,
-                               selectedAreaId,
-                               onSelect,
-                               onToggle,
-                               onDelete,
-                           }: {
+                                areas,
+                                onToggle,
+                                onDelete,
+                                className,
+                                overlayEnabled,
+                                onOverlayToggle,
+                                satelliteEnabled,
+                                onSatelliteToggle,
+                            }: {
     areas: IndexedArea[]
-    selectedAreaId: string | null
-    onSelect: (id: string) => void
     onToggle: (id: string) => void
     onDelete: (id: string) => void
+    className?: string
+    overlayEnabled: boolean
+    onOverlayToggle: () => void
+    satelliteEnabled: boolean
+    onSatelliteToggle: () => void
 }) {
     const [open, setOpen] = useState(true)
+    const panelClass = `bg-white/90 border border-gray-200 rounded-lg shadow-sm overflow-hidden ${className ?? 'w-64'}`
 
     return (
-        <div className="w-64 bg-white/90 border border-gray-200 rounded-lg shadow-sm overflow-hidden">
-            <button
-                onClick={() => setOpen(v => !v)}
-                className="w-full px-3 py-2 flex items-center justify-between text-[11px] text-gray-600 hover:text-gray-800 transition-colors"
-            >
-                <span>Indexed areas ({areas.length})</span>
-                <span className="text-gray-300">{open ? '–' : '+'}</span>
-            </button>
+        <div className={panelClass}>
+            <div className="w-full px-3 py-2 flex items-center justify-between gap-2">
+                <button
+                    onClick={() => setOpen(v => !v)}
+                    className="flex items-center gap-2 text-[11px] text-gray-600 hover:text-gray-800 transition-colors"
+                >
+                    <span>Indexed areas ({areas.length})</span>
+                    <span className="text-gray-300">{open ? '–' : '+'}</span>
+                </button>
+                <div className="flex items-center gap-3">
+                    <label className="flex items-center gap-1.5 text-[10px] text-gray-400">
+                        <span>Indexed view</span>
+                        <input
+                            type="checkbox"
+                            checked={overlayEnabled}
+                            onChange={onOverlayToggle}
+                            className="accent-teal-600"
+                        />
+                    </label>
+                    <label className="flex items-center gap-1.5 text-[10px] text-gray-400">
+                        <span>Satellite</span>
+                        <input
+                            type="checkbox"
+                            checked={satelliteEnabled}
+                            onChange={onSatelliteToggle}
+                            className="accent-teal-600"
+                        />
+                    </label>
+                </div>
+            </div>
             {open && (
                 <div className="border-t border-gray-100 max-h-56 overflow-y-auto">
                     {areas.length === 0 && (
@@ -403,30 +705,21 @@ function IndexedAreasPanel({
                     )}
                     {areas.map(area => {
                         const active = area.active !== false
-                        const selected = area.id === selectedAreaId
                         return (
                             <div
                                 key={area.id}
-                                className={`w-full px-3 py-2 text-[11px] border-l-2 transition-colors ${
-                                    selected ? 'border-teal-500 bg-teal-50/60' : 'border-transparent hover:bg-gray-50'
-                                }`}
+                                className="w-full px-3 py-2 text-[11px] border-l-2 border-transparent hover:bg-gray-50 transition-colors"
                             >
-                                <button
-                                    type="button"
-                                    onClick={() => onSelect(area.id)}
-                                    className="w-full text-left"
-                                >
-                                    <div className="flex items-center justify-between gap-2">
-                                        <div className="min-w-0">
-                                            <p className={`truncate ${selected ? 'text-teal-700 font-medium' : 'text-gray-600'}`}>
-                                                {area.label}
-                                            </p>
-                                            <p className="text-[10px] text-gray-400 font-mono truncate">
-                                                {area.bbox.minX.toFixed(2)},{area.bbox.minY.toFixed(2)} → {area.bbox.maxX.toFixed(2)},{area.bbox.maxY.toFixed(2)}
-                                            </p>
-                                        </div>
+                                <div className="flex items-center justify-between gap-2">
+                                    <div className="min-w-0">
+                                        <p className="truncate text-gray-600">
+                                            {area.label}
+                                        </p>
+                                        <p className="text-[10px] text-gray-400 font-mono truncate">
+                                            {area.bbox.minX.toFixed(2)},{area.bbox.minY.toFixed(2)} → {area.bbox.maxX.toFixed(2)},{area.bbox.maxY.toFixed(2)}
+                                        </p>
                                     </div>
-                                </button>
+                                </div>
                                 <div className="mt-1.5 flex items-center justify-between">
                                     <label className="flex items-center gap-1 text-[10px] text-gray-400">
                                         <input
