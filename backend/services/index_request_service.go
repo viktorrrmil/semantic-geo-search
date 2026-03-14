@@ -7,13 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 )
 
 const (
-	defaultMainBackendURL = "http://localhost:8080"
-	indexEndpointPath     = "/api/v1/semantic-geo-search/index"
+	indexEndpointPath = "/api/v1/semantic-geo-search/index"
 )
 
 // IndexRequest matches the payload sent by the frontend for indexing.
@@ -53,12 +51,4 @@ func SendIndexRequest(ctx context.Context, payload IndexRequest) error {
 		return fmt.Errorf("main backend returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 	return nil
-}
-
-func mainBackendURL() string {
-	base := strings.TrimSpace(os.Getenv("MAIN_BACKEND_URL"))
-	if base == "" {
-		base = defaultMainBackendURL
-	}
-	return strings.TrimRight(base, "/")
 }

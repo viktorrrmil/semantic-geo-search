@@ -7,6 +7,8 @@ import (
 
 // Register mounts all API routes onto the provided engine.
 func Register(r *gin.Engine) {
+	r.POST("/search", handlers.Search)
+
 	v1 := r.Group("/api/v1")
 	{
 		// GET /api/v1/list-files/*url
