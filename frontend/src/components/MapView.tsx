@@ -1,286 +1,512 @@
-import { useState, useRef, useEffect } from 'react'
+import {useState, useRef, useEffect, useMemo} from 'react'
 import DeckGL from '@deck.gl/react'
-import { TileLayer } from '@deck.gl/geo-layers'
-import { BitmapLayer, PolygonLayer, ScatterplotLayer, PathLayer } from '@deck.gl/layers'
-import { WebMercatorViewport } from '@deck.gl/core'
-import type { MapViewState, PickingInfo } from '@deck.gl/core'
-import type { SpatialFeature } from './DataPanel'
+import {TileLayer} from '@deck.gl/geo-layers'
+import {BitmapLayer, PolygonLayer, ScatterplotLayer, PathLayer} from '@deck.gl/layers'
+import {WebMercatorViewport} from '@deck.gl/core'
+import type {MapViewState, PickingInfo} from '@deck.gl/core'
+import type {SpatialFeature} from './DataPanel'
 
 export interface BBox {
-  minX: number
-  minY: number
-  maxX: number
-  maxY: number
+    minX: number
+    minY: number
+    maxX: number
+    maxY: number
+}
+
+export interface IndexedArea {
+    id: string
+    label: string
+    bbox: BBox
+    color?: [number, number, number]
+    active?: boolean
+}
+
+interface Rect {
+    minX: number
+    minY: number
+    maxX: number
+    maxY: number
 }
 
 interface Props {
-  features: SpatialFeature[]
+    features?: SpatialFeature[]
+    indexedAreas?: IndexedArea[]
+    dimMap?: boolean
+    selectionBBox?: BBox | null
+    onSelectionChange?: (bbox: BBox | null) => void
+    drawMode?: 'none' | 'shift' | 'always'
 }
 
 const INITIAL_VIEW_STATE: MapViewState = {
-  longitude: 0,
-  latitude: 20,
-  zoom: 2,
-  pitch: 0,
-  bearing: 0,
+    longitude: 0,
+    latitude: 20,
+    zoom: 2,
+    pitch: 0,
+    bearing: 0,
 }
 
+const WORLD_RING: [number, number][] = [
+    [-180, -85],
+    [180, -85],
+    [180, 85],
+    [-180, 85],
+]
+
 const OSM_LAYER = new TileLayer({
-  id: 'osm',
-  data: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-  maxZoom: 19,
-  minZoom: 0,
-  tileSize: 256,
-  renderSubLayers: (props) => {
-    const { boundingBox } = props.tile
-    return new BitmapLayer(props, {
-      data: undefined,
-      image: props.data,
-      bounds: [boundingBox[0][0], boundingBox[0][1], boundingBox[1][0], boundingBox[1][1]],
-    })
-  },
+    id: 'osm',
+    data: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    maxZoom: 19,
+    minZoom: 0,
+    tileSize: 256,
+    renderSubLayers: (props) => {
+        const {boundingBox} = props.tile
+        return new BitmapLayer(props, {
+            data: undefined,
+            image: props.data,
+            bounds: [boundingBox[0][0], boundingBox[0][1], boundingBox[1][0], boundingBox[1][1]],
+        })
+    },
 })
 
 // ── WKT parsing ───────────────────────────────────────────────────────────────
 
 /** Parse "x y" or "x y z" pairs from a coordinate string */
 function parseCoords(s: string): [number, number][] {
-  const pairs: [number, number][] = []
-  const re = /([-\d.eE]+)\s+([-\d.eE]+)(?:\s+[-\d.eE]+)?/g
-  let m
-  while ((m = re.exec(s)) !== null) {
-    const x = parseFloat(m[1])
-    const y = parseFloat(m[2])
-    if (!isNaN(x) && !isNaN(y) && isFinite(x) && isFinite(y)) pairs.push([x, y])
-  }
-  return pairs
+    const pairs: [number, number][] = []
+    const re = /([-\d.eE]+)\s+([-\d.eE]+)(?:\s+[-\d.eE]+)?/g
+    let m
+    while ((m = re.exec(s)) !== null) {
+        const x = parseFloat(m[1])
+        const y = parseFloat(m[2])
+        if (!isNaN(x) && !isNaN(y) && isFinite(x) && isFinite(y)) pairs.push([x, y])
+    }
+    return pairs
 }
 
 /** Extract all innermost parenthesized coordinate strings from a WKT */
 function innerRings(wkt: string): string[] {
-  const groups: string[] = []
-  const re = /\(([^()]+)\)/g
-  let m
-  while ((m = re.exec(wkt)) !== null) groups.push(m[1])
-  return groups
+    const groups: string[] = []
+    const re = /\(([^()]+)\)/g
+    let m
+    while ((m = re.exec(wkt)) !== null) groups.push(m[1])
+    return groups
 }
 
 /** Compute a bounding box that contains all feature geometries */
 function featuresBbox(features: SpatialFeature[]): [[number, number], [number, number]] | null {
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-  let any = false
-  for (const f of features) {
-    const all = parseCoords(f.geometry)
-    for (const [x, y] of all) {
-      if (x < minX) minX = x; if (x > maxX) maxX = x
-      if (y < minY) minY = y; if (y > maxY) maxY = y
-      any = true
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+    let any = false
+    for (const f of features) {
+        const all = parseCoords(f.geometry)
+        for (const [x, y] of all) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y
+            any = true
+        }
     }
-  }
-  return any ? [[minX, minY], [maxX, maxY]] : null
+    return any ? [[minX, minY], [maxX, maxY]] : null
 }
 
 // ── Geometry categorization ───────────────────────────────────────────────────
 
-interface PointDatum  { pos: [number, number]; feature: SpatialFeature }
-interface PolyDatum   { rings: [number, number][][]; feature: SpatialFeature }
-interface PathDatum   { path: [number, number][]; feature: SpatialFeature }
+interface PointDatum {
+    pos: [number, number];
+    feature: SpatialFeature
+}
+
+interface PolyDatum {
+    rings: [number, number][][];
+    feature: SpatialFeature
+}
+
+interface PathDatum {
+    path: [number, number][];
+    feature: SpatialFeature
+}
 
 function categorize(features: SpatialFeature[]) {
-  const points: PointDatum[] = []
-  const polys:  PolyDatum[]  = []
-  const paths:  PathDatum[]  = []
+    const points: PointDatum[] = []
+    const polys: PolyDatum[] = []
+    const paths: PathDatum[] = []
 
-  for (const f of features) {
-    const g = f.geometry?.trim() ?? ''
-    const upper = g.toUpperCase()
+    for (const f of features) {
+        const g = f.geometry?.trim() ?? ''
+        const upper = g.toUpperCase()
 
-    if (upper.startsWith('POINT')) {
-      const c = parseCoords(g)
-      if (c[0]) points.push({ pos: c[0], feature: f })
+        if (upper.startsWith('POINT')) {
+            const c = parseCoords(g)
+            if (c[0]) points.push({pos: c[0], feature: f})
 
-    } else if (upper.startsWith('MULTIPOINT')) {
-      for (const ring of innerRings(g)) {
-        const c = parseCoords(ring)
-        if (c[0]) points.push({ pos: c[0], feature: f })
-      }
+        } else if (upper.startsWith('MULTIPOINT')) {
+            for (const ring of innerRings(g)) {
+                const c = parseCoords(ring)
+                if (c[0]) points.push({pos: c[0], feature: f})
+            }
 
-    } else if (upper.startsWith('POLYGON') || upper.startsWith('MULTIPOLYGON')) {
-      // Each innermost paren group is a ring; render each as a filled polygon.
-      for (const ring of innerRings(g)) {
-        const c = parseCoords(ring)
-        if (c.length >= 3) polys.push({ rings: [c], feature: f })
-      }
+        } else if (upper.startsWith('POLYGON') || upper.startsWith('MULTIPOLYGON')) {
+            // Each innermost paren group is a ring; render each as a filled polygon.
+            for (const ring of innerRings(g)) {
+                const c = parseCoords(ring)
+                if (c.length >= 3) polys.push({rings: [c], feature: f})
+            }
 
-    } else if (upper.startsWith('LINESTRING') || upper.startsWith('MULTILINESTRING')) {
-      for (const ring of innerRings(g)) {
-        const c = parseCoords(ring)
-        if (c.length >= 2) paths.push({ path: c, feature: f })
-      }
+        } else if (upper.startsWith('LINESTRING') || upper.startsWith('MULTILINESTRING')) {
+            for (const ring of innerRings(g)) {
+                const c = parseCoords(ring)
+                if (c.length >= 2) paths.push({path: c, feature: f})
+            }
+        }
     }
-  }
 
-  return { points, polys, paths }
+    return {points, polys, paths}
 }
 
 // ── Tooltip helpers ───────────────────────────────────────────────────────────
 
 function resolveLabel(feature: SpatialFeature): string {
-  const p = feature.properties
-  const names = p.names
-  if (typeof names === 'object' && names !== null) {
-    const n = names as Record<string, unknown>
-    if (typeof n.primary === 'string') return n.primary
-  }
-  if (typeof names === 'string' && names.startsWith('{')) {
-    try { const n = JSON.parse(names); if (n?.primary) return String(n.primary) } catch { /**/ }
-  }
-  if (typeof p.name === 'string' && p.name) return p.name
-  if (typeof p.id === 'string') return p.id.slice(0, 20)
-  return 'Feature'
+    const p = feature.properties
+    const names = p.names
+    if (typeof names === 'object' && names !== null) {
+        const n = names as Record<string, unknown>
+        if (typeof n.primary === 'string') return n.primary
+    }
+    if (typeof names === 'string' && names.startsWith('{')) {
+        try {
+            const n = JSON.parse(names);
+            if (n?.primary) return String(n.primary)
+        } catch { /**/
+        }
+    }
+    if (typeof p.name === 'string' && p.name) return p.name
+    if (typeof p.id === 'string') return p.id.slice(0, 20)
+    return 'Feature'
 }
 
 function resolveSubtitle(feature: SpatialFeature): string {
-  const p = feature.properties
-  for (const key of ['class', 'subtype', 'confidence', 'height', 'level']) {
-    if (key in p && p[key] != null) return `${key}: ${p[key]}`
-  }
-  const cats = p.categories
-  if (typeof cats === 'object' && cats !== null) {
-    const c = cats as Record<string, unknown>
-    if (typeof c.primary === 'string') return c.primary
-  }
-  return ''
+    const p = feature.properties
+    for (const key of ['class', 'subtype', 'confidence', 'height', 'level']) {
+        if (key in p && p[key] != null) return `${key}: ${p[key]}`
+    }
+    const cats = p.categories
+    if (typeof cats === 'object' && cats !== null) {
+        const c = cats as Record<string, unknown>
+        if (typeof c.primary === 'string') return c.primary
+    }
+    return ''
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export default function MapView({ features }: Props) {
-  const containerRef = useRef<HTMLDivElement>(null)
-  const [viewState, setViewState] = useState<MapViewState>(INITIAL_VIEW_STATE)
-  const vsRef = useRef<MapViewState>(INITIAL_VIEW_STATE)
+export default function MapView({
+                                    features,
+                                    indexedAreas,
+                                    dimMap = false,
+                                    selectionBBox,
+                                    onSelectionChange,
+                                    drawMode = 'none',
+                                }: Props) {
+    const containerRef = useRef<HTMLDivElement>(null)
+    const [viewState, setViewState] = useState<MapViewState>(INITIAL_VIEW_STATE)
+    const vsRef = useRef<MapViewState>(INITIAL_VIEW_STATE)
+    const [size, setSize] = useState({width: 0, height: 0})
+    const [isDrawing, setIsDrawing] = useState(false)
+    const [dragStart, setDragStart] = useState<[number, number] | null>(null)
+    const [dragCurrent, setDragCurrent] = useState<[number, number] | null>(null)
 
-  // Fly to fit features whenever the feature list changes
-  useEffect(() => {
-    if (!features.length || !containerRef.current) return
-    const bbox = featuresBbox(features)
-    if (!bbox) return
-    const { clientWidth: w, clientHeight: h } = containerRef.current
-    if (w === 0 || h === 0) return
+    const safeFeatures = useMemo(() => features ?? [], [features])
 
-    try {
-      const vp = new WebMercatorViewport({ width: w, height: h })
-      const { longitude, latitude, zoom } = vp.fitBounds(bbox, { padding: 60 })
-      const next = { ...vsRef.current, longitude, latitude, zoom: Math.min(zoom, 18) }
-      vsRef.current = next
-      setViewState(next)
-    } catch { /* fitBounds can throw for degenerate bbox */ }
-  }, [features])
+    useEffect(() => {
+        const el = containerRef.current
+        if (!el) return
+        const update = () => {
+            setSize({width: el.clientWidth, height: el.clientHeight})
+        }
+        update()
+        const ro = new ResizeObserver(update)
+        ro.observe(el)
+        return () => ro.disconnect()
+    }, [])
 
-  const { points, polys, paths } = categorize(features)
+    // Fly to fit features whenever the feature list changes
+    useEffect(() => {
+        if (!safeFeatures.length || !containerRef.current) return
+        const bbox = featuresBbox(safeFeatures)
+        if (!bbox) return
+        const {clientWidth: w, clientHeight: h} = containerRef.current
+        if (w === 0 || h === 0) return
 
-  const pointsLayer = points.length
-    ? new ScatterplotLayer<PointDatum>({
-        id: 'points',
-        data: points,
-        getPosition: d => d.pos,
-        getRadius: 6,
-        radiusUnits: 'pixels',
-        getFillColor: [59, 130, 246, 210],
-        getLineColor: [255, 255, 255, 180],
-        lineWidthMinPixels: 1.5,
-        stroked: true,
-        pickable: true,
-      })
-    : null
+        try {
+            const vp = new WebMercatorViewport({width: w, height: h})
+            const {longitude, latitude, zoom} = vp.fitBounds(bbox, {padding: 60})
+            const next = {...vsRef.current, longitude, latitude, zoom: Math.min(zoom, 18)}
+            vsRef.current = next
+            setViewState(next)
+        } catch { /* fitBounds can throw for degenerate bbox */
+        }
+    }, [safeFeatures])
 
-  const polysLayer = polys.length
-    ? new PolygonLayer<PolyDatum>({
-        id: 'polys',
-        data: polys,
-        getPolygon: d => d.rings,
-        getFillColor: [59, 130, 246, 40],
-        getLineColor: [59, 130, 246, 200],
-        lineWidthMinPixels: 1.5,
-        filled: true,
-        stroked: true,
-        pickable: true,
-      })
-    : null
+    const {points, polys, paths} = categorize(safeFeatures)
 
-  const pathsLayer = paths.length
-    ? new PathLayer<PathDatum>({
-        id: 'paths',
-        data: paths,
-        getPath: d => d.path,
-        getWidth: 2.5,
-        widthUnits: 'pixels',
-        getColor: [234, 88, 12, 210],
-        pickable: true,
-      })
-    : null
+    const pointsLayer = points.length
+        ? new ScatterplotLayer<PointDatum>({
+            id: 'points',
+            data: points,
+            getPosition: d => d.pos,
+            getRadius: 6,
+            radiusUnits: 'pixels',
+            getFillColor: [59, 130, 246, 210],
+            getLineColor: [255, 255, 255, 180],
+            lineWidthMinPixels: 1.5,
+            stroked: true,
+            pickable: true,
+        })
+        : null
 
-  const layers = [OSM_LAYER, polysLayer, pathsLayer, pointsLayer].filter(Boolean)
+    const polysLayer = polys.length
+        ? new PolygonLayer<PolyDatum>({
+            id: 'polys',
+            data: polys,
+            getPolygon: d => d.rings,
+            getFillColor: [59, 130, 246, 40],
+            getLineColor: [59, 130, 246, 200],
+            lineWidthMinPixels: 1.5,
+            filled: true,
+            stroked: true,
+            pickable: true,
+        })
+        : null
 
-  const getTooltip = (info: PickingInfo) => {
-    const object = info.object
-    if (!object) return null
-    const d = object as { feature?: SpatialFeature }
-    const feature = d.feature
-    if (!feature) return null
-    const label = resolveLabel(feature)
-    const sub = resolveSubtitle(feature)
-    return {
-      text: sub ? `${label}\n${sub}` : label,
-      style: {
-        fontSize: '11px',
-        padding: '5px 8px',
-        background: 'white',
-        color: '#374151',
-        borderRadius: '4px',
-        boxShadow: '0 1px 4px rgba(0,0,0,0.12)',
-        whiteSpace: 'pre',
-      },
+    const pathsLayer = paths.length
+        ? new PathLayer<PathDatum>({
+            id: 'paths',
+            data: paths,
+            getPath: d => d.path,
+            getWidth: 2.5,
+            widthUnits: 'pixels',
+            getColor: [234, 88, 12, 210],
+            pickable: true,
+        })
+        : null
+
+    function bboxToPolygon(bbox: BBox): [number, number][][] {
+        return [[
+            [bbox.minX, bbox.minY],
+            [bbox.maxX, bbox.minY],
+            [bbox.maxX, bbox.maxY],
+            [bbox.minX, bbox.maxY],
+        ]]
     }
-  }
 
-  return (
-    <div ref={containerRef} className="relative w-full h-full select-none">
-      <DeckGL
-        viewState={viewState}
-        onViewStateChange={({ viewState: vs }) => {
-          const next = vs as MapViewState
-          vsRef.current = next
-          setViewState(next)
-        }}
-        controller
-        layers={layers}
-        style={{ width: '100%', height: '100%' }}
-        getTooltip={getTooltip}
-      />
+    function normalizeRect(bbox: BBox): Rect {
+        const minX = Math.min(bbox.minX, bbox.maxX)
+        const maxX = Math.max(bbox.minX, bbox.maxX)
+        const minY = Math.min(bbox.minY, bbox.maxY)
+        const maxY = Math.max(bbox.minY, bbox.maxY)
+        return {minX, maxX, minY, maxY}
+    }
 
-      {/* Feature count overlay */}
-      {features.length > 0 && (
-        <div className="absolute top-2 left-1/2 -translate-x-1/2 pointer-events-none">
+    function unionRectangles(rects: Rect[]): Rect[] {
+        if (rects.length === 0) return []
+        const xs = Array.from(new Set(rects.flatMap(r => [r.minX, r.maxX]))).sort((a, b) => a - b)
+        const results: Rect[] = []
+
+        for (let i = 0; i < xs.length - 1; i += 1) {
+            const x1 = xs[i]
+            const x2 = xs[i + 1]
+            if (x2 <= x1) continue
+            const active = rects.filter(r => r.minX <= x1 && r.maxX >= x2)
+            if (active.length === 0) continue
+
+            const ys = active
+                .map(r => [r.minY, r.maxY] as [number, number])
+                .sort((a, b) => a[0] - b[0])
+
+            let [curStart, curEnd] = ys[0]
+            for (let j = 1; j < ys.length; j += 1) {
+                const [start, end] = ys[j]
+                if (start <= curEnd) {
+                    curEnd = Math.max(curEnd, end)
+                } else {
+                    results.push({minX: x1, maxX: x2, minY: curStart, maxY: curEnd})
+                    curStart = start
+                    curEnd = end
+                }
+            }
+            results.push({minX: x1, maxX: x2, minY: curStart, maxY: curEnd})
+        }
+
+        return results
+    }
+
+    const indexedRects = useMemo(() => {
+        const rects = (indexedAreas ?? [])
+            .filter(a => a.active !== false)
+            .map(a => normalizeRect(a.bbox))
+            .filter(r => r.maxX > r.minX && r.maxY > r.minY)
+        return unionRectangles(rects)
+    }, [indexedAreas])
+
+    const dimPolygon = useMemo(() => {
+        if (!dimMap) return null
+        const holes = indexedRects.map(r => bboxToPolygon(r)[0])
+        return [WORLD_RING, ...holes]
+    }, [dimMap, indexedRects])
+
+    const dimLayer = dimMap && dimPolygon
+        ? new PolygonLayer({
+            id: 'dim-overlay',
+            data: [dimPolygon],
+            getPolygon: d => d,
+            getFillColor: [2, 6, 23, 95],
+            stroked: false,
+            filled: true,
+            pickable: false,
+        })
+        : null
+
+    const viewport = useMemo(() => {
+        if (size.width === 0 || size.height === 0) return null
+        return new WebMercatorViewport({width: size.width, height: size.height, ...viewState})
+    }, [size, viewState])
+
+    const previewBBox = useMemo(() => {
+        if (!viewport || !dragStart || !dragCurrent) return null
+        const start = viewport.unproject(dragStart) as [number, number]
+        const end = viewport.unproject(dragCurrent) as [number, number]
+        const minX = Math.min(start[0], end[0])
+        const maxX = Math.max(start[0], end[0])
+        const minY = Math.min(start[1], end[1])
+        const maxY = Math.max(start[1], end[1])
+        return {minX, minY, maxX, maxY}
+    }, [viewport, dragStart, dragCurrent])
+
+    const selectionLayer = selectionBBox || previewBBox
+        ? new PolygonLayer({
+            id: 'selection-bbox',
+            data: [selectionBBox ?? previewBBox!],
+            getPolygon: d => bboxToPolygon(d),
+            getFillColor: selectionBBox ? [59, 130, 246, 60] : [59, 130, 246, 30],
+            getLineColor: selectionBBox ? [59, 130, 246, 200] : [59, 130, 246, 140],
+            lineWidthMinPixels: 2,
+            filled: true,
+            stroked: true,
+            pickable: false,
+        })
+        : null
+
+    const layers = [
+        OSM_LAYER,
+        dimLayer,
+        selectionLayer,
+        polysLayer,
+        pathsLayer,
+        pointsLayer,
+    ].filter(Boolean)
+
+    const getTooltip = (info: PickingInfo) => {
+        const object = info.object
+        if (!object) return null
+        const d = object as { feature?: SpatialFeature }
+        const feature = d.feature
+        if (!feature) return null
+        const label = resolveLabel(feature)
+        const sub = resolveSubtitle(feature)
+        return {
+            text: sub ? `${label}\n${sub}` : label,
+            style: {
+                fontSize: '11px',
+                padding: '5px 8px',
+                background: 'white',
+                color: '#374151',
+                borderRadius: '4px',
+                boxShadow: '0 1px 4px rgba(0,0,0,0.12)',
+                whiteSpace: 'pre',
+            },
+        }
+    }
+
+    return (
+        <div ref={containerRef} className="relative w-full h-full select-none">
+            <DeckGL
+                viewState={viewState}
+                onViewStateChange={({viewState: vs}) => {
+                    const next = vs as MapViewState
+                    vsRef.current = next
+                    setViewState(next)
+                }}
+                controller={{
+                    dragPan: !isDrawing,
+                    dragRotate: false,
+                    touchRotate: false,
+                    scrollZoom: true,
+                    doubleClickZoom: true,
+                }}
+                layers={layers}
+                style={{width: '100%', height: '100%'}}
+                getTooltip={getTooltip}
+                onDragStart={(info, event) => {
+                    if (!onSelectionChange) return
+                    if (!containerRef.current) return
+                    const shouldDraw = drawMode === 'always' || (drawMode !== 'none' && event?.srcEvent?.shiftKey)
+                    if (!shouldDraw) return
+                    setIsDrawing(true)
+                    setDragStart([info.x, info.y])
+                    setDragCurrent([info.x, info.y])
+                }}
+                onDrag={info => {
+                    if (!isDrawing) return
+                    setDragCurrent([info.x, info.y])
+                }}
+                onDragEnd={() => {
+                    if (!isDrawing || !dragStart || !dragCurrent || !viewport) {
+                        setIsDrawing(false)
+                        setDragStart(null)
+                        setDragCurrent(null)
+                        return
+                    }
+                    const start = viewport.unproject(dragStart) as [number, number]
+                    const end = viewport.unproject(dragCurrent) as [number, number]
+                    const minX = Math.min(start[0], end[0])
+                    const maxX = Math.max(start[0], end[0])
+                    const minY = Math.min(start[1], end[1])
+                    const maxY = Math.max(start[1], end[1])
+                    const minDrag = 3
+                    const dx = Math.abs(dragCurrent[0] - dragStart[0])
+                    const dy = Math.abs(dragCurrent[1] - dragStart[1])
+                    if (dx > minDrag && dy > minDrag) {
+                        onSelectionChange?.({minX, minY, maxX, maxY})
+                    }
+                    setIsDrawing(false)
+                    setDragStart(null)
+                    setDragCurrent(null)
+                }}
+            />
+
+            {/* Feature count overlay */}
+            {safeFeatures.length > 0 && (
+                <div className="absolute top-2 left-1/2 -translate-x-1/2 pointer-events-none">
           <span className="text-[10px] text-gray-600 bg-white/90 px-2.5 py-1 rounded shadow-sm whitespace-nowrap">
-            {features.length} feature{features.length !== 1 ? 's' : ''} loaded
+            {safeFeatures.length} feature{safeFeatures.length !== 1 ? 's' : ''} loaded
           </span>
-        </div>
-      )}
+                </div>
+            )}
 
-      {/* OSM attribution */}
-      <div className="absolute bottom-2 right-2 text-[10px] text-gray-400 bg-white/80 px-1.5 py-0.5 rounded pointer-events-none">
-        ©{' '}
-        <a
-          href="https://www.openstreetmap.org/copyright"
-          className="underline pointer-events-auto"
-          target="_blank"
-          rel="noreferrer"
-        >
-          OpenStreetMap
-        </a>{' '}
-        contributors
-      </div>
-    </div>
-  )
+            {/* OSM attribution */}
+            <div
+                className="absolute bottom-2 right-2 text-[10px] text-gray-400 bg-white/80 px-1.5 py-0.5 rounded pointer-events-none">
+                ©{' '}
+                <a
+                    href="https://www.openstreetmap.org/copyright"
+                    className="underline pointer-events-auto"
+                    target="_blank"
+                    rel="noreferrer"
+                >
+                    OpenStreetMap
+                </a>{' '}
+                contributors
+            </div>
+        </div>
+    )
 }
