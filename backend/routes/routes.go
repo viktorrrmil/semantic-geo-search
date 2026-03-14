@@ -22,8 +22,8 @@ func Register(r *gin.Engine) {
 		v1.GET("/spatial-data", handlers.GetSpatialData)
 
 		// POST /api/v1/index-file
-		// Accepts an S3 path (file or folder) and an optional row-count limit,
-		// then kicks off asynchronous indexing of the target Parquet data.
+		// Accepts an S3 path, region, bbox bounds, and "all" flag, then forwards
+		// the request to the main backend for asynchronous indexing.
 		v1.POST("/index-file", handlers.IndexFile)
 	}
 }
