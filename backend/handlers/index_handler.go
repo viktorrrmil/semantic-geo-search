@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 
@@ -9,108 +10,63 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const (
-	defaultIndexK      = 100
-	defaultIndexRegion = "us-west-2"
-	addBatchURL        = "http://localhost:8080/vector_store/add_batch"
-)
-
-// IndexFileRequest is the payload for POST /api/v1/index-file.
-type IndexFileRequest struct {
-	S3Path string `json:"s3_path" binding:"required"`
-	Count  int    `json:"count"`
-	Region string `json:"region"`
-}
-
 // IndexFile handles POST /api/v1/index-file.
 //
-// It fetches up to Count rows from the Parquet file at S3Path using DuckDB,
-// converts each row into a rich text string, then POSTs the whole batch to the
-// vector-search backend at localhost:8080/add-batch for embedding and indexing.
+// It validates the incoming bbox request and forwards it to the main backend's
+// /api/v1/semantic-geo-search/index endpoint for asynchronous indexing.
 func IndexFile(c *gin.Context) {
-	var req IndexFileRequest
+	var req services.IndexRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	req.S3Path = strings.TrimSpace(req.S3Path)
+	if req.S3Path == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "s3_path is required"})
+		return
+	}
+
+	req.Region = strings.TrimSpace(req.Region)
 	if req.Region == "" {
-		req.Region = defaultIndexRegion
+		req.Region = defaultRegion
 	}
-	if req.Count <= 0 {
-		req.Count = defaultIndexK
-	}
-	if req.Count > maxK {
-		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("count exceeds maximum of %d", maxK)})
+
+	if err := validateBBox(req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Fetch rows from the Parquet file via DuckDB.
-	svc, err := services.GetDuckDB()
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "DuckDB service unavailable: " + err.Error()})
+	if err := services.SendIndexRequest(c.Request.Context(), req); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to start indexing: " + err.Error()})
 		return
 	}
 
-	rows, err := svc.QueryFile(c.Request.Context(), req.S3Path, req.Region, req.Count)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query file: " + err.Error()})
-		return
-	}
-
-	if len(rows) == 0 {
-		c.JSON(http.StatusOK, gin.H{
-			"message": "no rows found",
-			"s3_path": req.S3Path,
-			"indexed": 0,
-		})
-		return
-	}
-
-	// Convert each row to an IndexDoc (id + text representation).
-	docs := make([]string, 0, len(rows))
-	for _, row := range rows {
-		//id := extractID(row)
-		text := services.BuildRowText(row)
-		if text == "" {
-			continue
-		}
-		//docs = append(docs, services.IndexDoc{
-		//	ID:   id,
-		//	Text: text,
-		//	Metadata: map[string]any{
-		//		"source": req.S3Path,
-		//	},
-		//})
-		docs = append(docs, text)
-	}
-
-	// Send the batch to the vector-search backend.
-	batchResp, err := services.SendBatch(c.Request.Context(), addBatchURL, docs)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{
-			"error":   "failed to send batch to search backend: " + err.Error(),
-			"indexed": 0,
-			"built":   len(docs),
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"s3_path":        req.S3Path,
-		"fetched":        len(rows),
-		"sent":           len(docs),
-		"batch_response": batchResp,
+	c.JSON(http.StatusAccepted, gin.H{
+		"message":    "indexing started",
+		"s3_path":    req.S3Path,
+		"region":     req.Region,
+		"bbox_min_x": req.BBoxMinX,
+		"bbox_max_x": req.BBoxMaxX,
+		"bbox_min_y": req.BBoxMinY,
+		"bbox_max_y": req.BBoxMaxY,
+		"all":        req.All,
+		"count":      req.Count,
 	})
 }
 
-// extractID pulls the row's id field, falling back to a sequential placeholder.
-func extractID(row map[string]any) string {
-	for _, key := range []string{"id", "ID", "uuid", "fid", "osm_id"} {
-		if v, ok := row[key]; ok && v != nil {
-			return fmt.Sprintf("%v", v)
-		}
+func validateBBox(req services.IndexRequest) error {
+	if math.IsNaN(req.BBoxMinX) || math.IsNaN(req.BBoxMaxX) || math.IsNaN(req.BBoxMinY) || math.IsNaN(req.BBoxMaxY) {
+		return fmt.Errorf("bbox values must be valid numbers")
 	}
-	return fmt.Sprintf("row-%p", &row)
+	if math.IsInf(req.BBoxMinX, 0) || math.IsInf(req.BBoxMaxX, 0) || math.IsInf(req.BBoxMinY, 0) || math.IsInf(req.BBoxMaxY, 0) {
+		return fmt.Errorf("bbox values must be finite numbers")
+	}
+	if req.BBoxMinX >= req.BBoxMaxX {
+		return fmt.Errorf("bbox_min_x must be less than bbox_max_x")
+	}
+	if req.BBoxMinY >= req.BBoxMaxY {
+		return fmt.Errorf("bbox_min_y must be less than bbox_max_y")
+	}
+	return nil
 }
