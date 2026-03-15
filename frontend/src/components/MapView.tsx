@@ -19,6 +19,10 @@ export interface IndexedArea {
     bbox: BBox
     color?: [number, number, number]
     active?: boolean
+    source?: string
+    totalPoints?: number
+    indexedPoints?: number
+    indexedPercent?: number
 }
 
 interface Rect {
@@ -36,6 +40,7 @@ interface Props {
     onSelectionChange?: (bbox: BBox | null) => void
     drawMode?: 'none' | 'shift' | 'always'
     focusedFeature?: SpatialFeature | null
+    focusedBBox?: BBox | null
     baseMap?: 'osm' | 'satellite'
 }
 
@@ -177,6 +182,10 @@ function featureBbox(feature: SpatialFeature): [[number, number], [number, numbe
         if (y > maxY) maxY = y
     }
     return [[minX, minY], [maxX, maxY]]
+}
+
+function bboxToBounds(bbox: BBox): [[number, number], [number, number]] {
+    return [[bbox.minX, bbox.minY], [bbox.maxX, bbox.maxY]]
 }
 
 // ── Geometry categorization ───────────────────────────────────────────────────
@@ -357,6 +366,7 @@ export default function MapView({
                                      onSelectionChange,
                                      drawMode = 'none',
                                      focusedFeature = null,
+                                     focusedBBox = null,
                                      baseMap = 'osm',
                                  }: Props) {
     const containerRef = useRef<HTMLDivElement>(null)
@@ -434,6 +444,28 @@ export default function MapView({
             setViewState(next)
         } catch { /* ignore fit errors */ }
     }, [focusedFeature, size.width, size.height])
+
+    // Fly to a focused bbox (indexed area)
+    useEffect(() => {
+        if (!focusedBBox || !containerRef.current) return
+        const {clientWidth: w, clientHeight: h} = containerRef.current
+        if (w === 0 || h === 0) return
+        const bounds = bboxToBounds(focusedBBox)
+        try {
+            const vp = new WebMercatorViewport({width: w, height: h})
+            const fitted = vp.fitBounds(bounds, {padding: 80})
+            const next = {
+                ...vsRef.current,
+                longitude: fitted.longitude,
+                latitude: fitted.latitude,
+                zoom: Math.min(fitted.zoom, 18),
+                transitionDuration: 1200,
+                transitionInterpolator: new FlyToInterpolator({speed: 1.6}),
+            }
+            vsRef.current = next
+            setViewState(next)
+        } catch { /* ignore fit errors */ }
+    }, [focusedBBox, size.width, size.height])
 
     const {points, polys, paths} = categorize(safeFeatures)
 

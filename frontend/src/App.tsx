@@ -6,18 +6,9 @@ import './App.css'
 
 const API = 'http://localhost:3001/api/v1'
 const SEARCH_API = 'http://localhost:3001'
+const INDEXED_AREAS_API = 'http://localhost:3001/api/v1/geo/indexed-areas'
 const DEFAULT_TOP_K = 5
 const TOP_K_PRESETS = [5, 10, 25, 50]
-
-const HARD_CODED_AREAS: IndexedArea[] = [
-    {
-        id: 'demo-berlin',
-        label: 'Berlin Mitte',
-        bbox: {minX: 13.35, minY: 52.49, maxX: 13.45, maxY: 52.55},
-        color: [16, 185, 129],
-        active: true,
-    },
-]
 
 type Page = 'main' | 'index'
 type Status = 'idle' | 'loading' | 'success' | 'error'
@@ -32,10 +23,86 @@ interface SearchResult {
     raw?: unknown
 }
 
+interface IndexedAreaRow {
+    id?: string | number
+    source?: string | null
+    bbox_min_x?: number | string | null
+    bbox_max_x?: number | string | null
+    bbox_min_y?: number | string | null
+    bbox_max_y?: number | string | null
+    bbox?: {
+        min_x?: number | string | null
+        max_x?: number | string | null
+        min_y?: number | string | null
+        max_y?: number | string | null
+    } | null
+    total_points?: number | string | null
+    indexed_points?: number | string | null
+    indexed_percent?: number | string | null
+}
+
 function isGeoJSONGeometry(value: unknown): value is GeoJSONGeometry {
     return typeof value === 'object' && value !== null
         && 'type' in value && typeof (value as GeoJSONGeometry).type === 'string'
         && 'coordinates' in value
+}
+
+function toNumber(value: unknown): number | null {
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+    if (typeof value === 'string' && value.trim() !== '') {
+        const parsed = Number(value)
+        if (Number.isFinite(parsed)) return parsed
+    }
+    return null
+}
+
+function normalizeIndexedArea(row: IndexedAreaRow, index: number): IndexedArea | null {
+    const minX = toNumber(row.bbox?.min_x ?? row.bbox_min_x)
+    const maxX = toNumber(row.bbox?.max_x ?? row.bbox_max_x)
+    const minY = toNumber(row.bbox?.min_y ?? row.bbox_min_y)
+    const maxY = toNumber(row.bbox?.max_y ?? row.bbox_max_y)
+    if (minX == null || maxX == null || minY == null || maxY == null) return null
+
+    const source = typeof row.source === 'string' ? row.source : ''
+    const id = row.id != null
+        ? String(row.id)
+        : `${source || 'area'}-${minX}-${minY}-${maxX}-${maxY}`
+    const totalPoints = toNumber(row.total_points)
+    const indexedPoints = toNumber(row.indexed_points)
+    const indexedPercent = toNumber(row.indexed_percent)
+
+    return {
+        id,
+        label: source || `Area ${index + 1}`,
+        bbox: {minX, minY, maxX, maxY},
+        source: source || undefined,
+        totalPoints: totalPoints ?? undefined,
+        indexedPoints: indexedPoints ?? undefined,
+        indexedPercent: indexedPercent ?? undefined,
+        active: true,
+    }
+}
+
+function parseIndexedAreasResponse(data: unknown): IndexedArea[] {
+    const rows = Array.isArray(data)
+        ? data
+        : (data && typeof data === 'object' && Array.isArray((data as {areas?: unknown}).areas))
+            ? (data as {areas: unknown[]}).areas
+            : null
+    if (!rows) throw new Error('Unexpected response format')
+    return rows
+        .map((row, index) => normalizeIndexedArea(row as IndexedAreaRow, index))
+        .filter((area): area is IndexedArea => area !== null)
+}
+
+function mergeActiveState(prev: IndexedArea[], next: IndexedArea[]) {
+    if (prev.length === 0) return next
+    const prevActive = new Map(prev.map(area => [area.id, area.active]))
+    return next.map(area => (
+        prevActive.has(area.id)
+            ? {...area, active: prevActive.get(area.id)}
+            : area
+    ))
 }
 
 function normalizeSearchResult(row: Record<string, unknown>, index: number): SearchResult {
@@ -81,9 +148,24 @@ function formatConfidence(value: number | null | undefined) {
     return `${pct}%`
 }
 
+function resolveIndexedPercent(area: IndexedArea): number | null {
+    if (typeof area.indexedPercent === 'number' && Number.isFinite(area.indexedPercent)) {
+        return Math.round(area.indexedPercent)
+    }
+    const total = area.totalPoints
+    const indexed = area.indexedPoints
+    if (typeof total === 'number' && Number.isFinite(total) && typeof indexed === 'number' && Number.isFinite(indexed) && total > 0) {
+        return Math.round((indexed / total) * 100)
+    }
+    return null
+}
+
 function App() {
     const [page, setPage] = useState<Page>('main')
-    const [indexedAreas, setIndexedAreas] = useState<IndexedArea[]>(HARD_CODED_AREAS)
+    const [indexedAreas, setIndexedAreas] = useState<IndexedArea[]>([])
+    const [indexedAreasStatus, setIndexedAreasStatus] = useState<Status>('idle')
+    const [indexedAreasError, setIndexedAreasError] = useState('')
+    const [selectedIndexedAreaId, setSelectedIndexedAreaId] = useState<string | null>(null)
     const [searchQuery, setSearchQuery] = useState('')
     const [topK, setTopK] = useState(String(DEFAULT_TOP_K))
     const [showTopKMenu, setShowTopKMenu] = useState(false)
@@ -106,6 +188,9 @@ function App() {
     const selectedResult = selectedResultId
         ? searchResults.find(result => result.id === selectedResultId) ?? null
         : null
+    const selectedIndexedArea = selectedIndexedAreaId
+        ? indexedAreas.find(area => area.id === selectedIndexedAreaId) ?? null
+        : null
 
     useEffect(() => {
         if (!showTopKMenu) return
@@ -118,6 +203,36 @@ function App() {
         document.addEventListener('mousedown', handler)
         return () => document.removeEventListener('mousedown', handler)
     }, [showTopKMenu])
+
+    useEffect(() => {
+        if (!selectedIndexedAreaId) return
+        if (!indexedAreas.some(area => area.id === selectedIndexedAreaId)) {
+            setSelectedIndexedAreaId(null)
+        }
+    }, [indexedAreas, selectedIndexedAreaId])
+
+    useEffect(() => {
+        const controller = new AbortController()
+        void loadIndexedAreas(controller.signal)
+        return () => controller.abort()
+    }, [])
+
+    async function loadIndexedAreas(signal?: AbortSignal) {
+        setIndexedAreasStatus('loading')
+        setIndexedAreasError('')
+        try {
+            const res = await fetch(INDEXED_AREAS_API, {signal})
+            if (!res.ok) throw new Error(`Server responded with ${res.status}`)
+            const data: unknown = await res.json()
+            const parsed = parseIndexedAreasResponse(data)
+            setIndexedAreas(prev => mergeActiveState(prev, parsed))
+            setIndexedAreasStatus('success')
+        } catch (err) {
+            if (err instanceof DOMException && err.name === 'AbortError') return
+            setIndexedAreasError(err instanceof Error ? err.message : 'Failed to load indexed areas')
+            setIndexedAreasStatus('error')
+        }
+    }
 
     async function handleSearchSubmit(e: FormEvent) {
         e.preventDefault()
@@ -231,18 +346,6 @@ function App() {
             if (successCount === 0) {
                 throw new Error(lastError || 'Failed to start indexing')
             }
-
-            const areaId = `${selectedFile.name}-${Date.now()}`
-            const newArea: IndexedArea = {
-                id: areaId,
-                label: selectedFile.type === 'folder'
-                    ? `${selectedFile.name} (${successCount} files)`
-                    : selectedFile.name,
-                bbox: selectionBBox,
-                color: [59, 130, 246],
-                active: true,
-            }
-            setIndexedAreas(prev => [...prev, newArea])
             if (successCount < files.length) {
                 setIndexMsg(`Indexed ${successCount}/${files.length} files. Last error: ${lastError}`)
                 setIndexStatus('error')
@@ -250,6 +353,7 @@ function App() {
                 setIndexMsg(`Indexing started for ${successCount} file${successCount !== 1 ? 's' : ''}.`)
                 setIndexStatus('success')
             }
+            await loadIndexedAreas()
         } catch (err) {
             setIndexMsg(err instanceof Error ? err.message : 'Failed to start indexing')
             setIndexStatus('error')
@@ -267,6 +371,7 @@ function App() {
                         indexedAreas={indexedAreas}
                         dimMap={showIndexedOverlay}
                         focusedFeature={focusedFeature}
+                        focusedBBox={selectedIndexedArea?.bbox ?? null}
                         baseMap={showSatellite ? 'satellite' : 'osm'}
                     />
 
@@ -433,10 +538,21 @@ function App() {
                             onOverlayToggle={() => setShowIndexedOverlay(v => !v)}
                             satelliteEnabled={showSatellite}
                             onSatelliteToggle={() => setShowSatellite(v => !v)}
+                            status={indexedAreasStatus}
+                            error={indexedAreasError}
+                            selectedId={selectedIndexedAreaId}
+                            onSelect={id => {
+                                setSelectedIndexedAreaId(id)
+                                setFocusedFeature(null)
+                            }}
                         />
                     </div>
 
                     <SelectedResultPanel result={selectedResult} />
+                    <IndexedAreaPopup
+                        area={selectedIndexedArea}
+                        onClose={() => setSelectedIndexedAreaId(null)}
+                    />
                 </div>
             ) : (
                 <div className="flex h-full w-full overflow-hidden">
@@ -645,16 +761,90 @@ function SelectedResultPanel({result}: { result: SearchResult | null }) {
     )
 }
 
+function IndexedAreaPopup({
+    area,
+    onClose,
+}: {
+    area: IndexedArea | null
+    onClose: () => void
+}) {
+    if (!area) return null
+    const percent = resolveIndexedPercent(area)
+    const percentLabel = percent == null ? '—' : `${percent}%`
+    const total = typeof area.totalPoints === 'number' ? area.totalPoints : null
+    const indexed = typeof area.indexedPoints === 'number' ? area.indexedPoints : null
+    return (
+        <div className="absolute bottom-6 right-4 z-30 w-80 max-w-[85vw] bg-white/95 border border-gray-200 rounded-lg shadow-lg overflow-hidden">
+            <div className="px-4 py-3 border-b border-gray-100 flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                    <p className="text-[11px] text-gray-400">Indexed area</p>
+                    <p className="text-sm text-gray-700 mt-1 leading-snug truncate">{area.label}</p>
+                    {area.source && (
+                        <p className="text-[10px] text-gray-400 truncate">{area.source}</p>
+                    )}
+                </div>
+                <button
+                    type="button"
+                    onClick={onClose}
+                    className="text-gray-300 hover:text-gray-500 transition-colors"
+                    aria-label="Close indexed area"
+                >
+                    ✕
+                </button>
+            </div>
+            <div className="px-4 py-3 space-y-3">
+                <div className="flex items-center justify-between text-[11px] text-gray-500">
+                    <span>Indexed coverage</span>
+                    <span className="font-medium text-gray-700">{percentLabel}</span>
+                </div>
+                <div className="h-2 rounded-full bg-gray-100 overflow-hidden">
+                    <div
+                        className="h-full bg-teal-500 transition-all"
+                        style={{width: `${percent ?? 0}%`}}
+                    />
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-[11px]">
+                    <div className="bg-gray-50 rounded-md px-2.5 py-2">
+                        <p className="text-[9px] uppercase tracking-wide text-gray-400">Indexed points</p>
+                        <p className="text-sm text-gray-700">
+                            {indexed != null ? indexed.toLocaleString() : '—'}
+                        </p>
+                    </div>
+                    <div className="bg-gray-50 rounded-md px-2.5 py-2">
+                        <p className="text-[9px] uppercase tracking-wide text-gray-400">Total points</p>
+                        <p className="text-sm text-gray-700">
+                            {total != null ? total.toLocaleString() : '—'}
+                        </p>
+                    </div>
+                </div>
+                <div className="text-[11px] text-gray-500">
+                    <p className="text-[9px] uppercase tracking-wide text-gray-400">Bounding box</p>
+                    <p className="font-mono text-[10px] text-gray-600 mt-1">
+                        W {area.bbox.minX.toFixed(4)} · E {area.bbox.maxX.toFixed(4)}
+                    </p>
+                    <p className="font-mono text-[10px] text-gray-600">
+                        S {area.bbox.minY.toFixed(4)} · N {area.bbox.maxY.toFixed(4)}
+                    </p>
+                </div>
+            </div>
+        </div>
+    )
+}
+
 function IndexedAreasPanel({
-                                areas,
-                                onToggle,
-                                onDelete,
-                                className,
-                                overlayEnabled,
-                                onOverlayToggle,
-                                satelliteEnabled,
-                                onSatelliteToggle,
-                            }: {
+                                 areas,
+                                 onToggle,
+                                 onDelete,
+                                 className,
+                                 overlayEnabled,
+                                 onOverlayToggle,
+                                 satelliteEnabled,
+                                 onSatelliteToggle,
+                                 status,
+                                 error,
+                                 selectedId,
+                                 onSelect,
+                             }: {
     areas: IndexedArea[]
     onToggle: (id: string) => void
     onDelete: (id: string) => void
@@ -663,6 +853,10 @@ function IndexedAreasPanel({
     onOverlayToggle: () => void
     satelliteEnabled: boolean
     onSatelliteToggle: () => void
+    status: Status
+    error: string
+    selectedId: string | null
+    onSelect: (id: string) => void
 }) {
     const [open, setOpen] = useState(true)
     const panelClass = `bg-white/90 border border-gray-200 rounded-lg shadow-sm overflow-hidden ${className ?? 'w-64'}`
@@ -700,15 +894,33 @@ function IndexedAreasPanel({
             </div>
             {open && (
                 <div className="border-t border-gray-100 max-h-56 overflow-y-auto">
-                    {areas.length === 0 && (
+                    {status === 'loading' && (
+                        <p className="px-3 py-2 text-[11px] text-gray-400">Loading indexed areas…</p>
+                    )}
+                    {status === 'error' && error && (
+                        <p className="px-3 py-2 text-[11px] text-rose-500">{error}</p>
+                    )}
+                    {status !== 'loading' && areas.length === 0 && (
                         <p className="px-3 py-3 text-[11px] text-gray-400">No indexed areas yet.</p>
                     )}
                     {areas.map(area => {
                         const active = area.active !== false
+                        const totalPoints = area.totalPoints
+                        const indexedPoints = area.indexedPoints
+                        const indexedPercent = resolveIndexedPercent(area)
+                        const hasCounts = typeof totalPoints === 'number'
+                            && Number.isFinite(totalPoints)
+                            && typeof indexedPoints === 'number'
+                            && Number.isFinite(indexedPoints)
+                        const isSelected = selectedId === area.id
+                        const percentText = indexedPercent == null ? '—' : `${indexedPercent}%`
                         return (
                             <div
                                 key={area.id}
-                                className="w-full px-3 py-2 text-[11px] border-l-2 border-transparent hover:bg-gray-50 transition-colors"
+                                className={`w-full px-3 py-2 text-[11px] border-l-2 transition-colors cursor-pointer ${
+                                    isSelected ? 'border-teal-400 bg-teal-50/60' : 'border-transparent hover:bg-gray-50'
+                                }`}
+                                onClick={() => onSelect(area.id)}
                             >
                                 <div className="flex items-center justify-between gap-2">
                                     <div className="min-w-0">
@@ -718,6 +930,14 @@ function IndexedAreasPanel({
                                         <p className="text-[10px] text-gray-400 font-mono truncate">
                                             {area.bbox.minX.toFixed(2)},{area.bbox.minY.toFixed(2)} → {area.bbox.maxX.toFixed(2)},{area.bbox.maxY.toFixed(2)}
                                         </p>
+                                        {(hasCounts || typeof indexedPercent === 'number') && (
+                                            <p className="text-[10px] text-gray-400">
+                                                {hasCounts
+                                                    ? `Indexed ${indexedPoints!.toLocaleString()} / ${totalPoints!.toLocaleString()}`
+                                                    : 'Indexed'}
+                                                {` (${percentText})`}
+                                            </p>
+                                        )}
                                     </div>
                                 </div>
                                 <div className="mt-1.5 flex items-center justify-between">
@@ -733,7 +953,10 @@ function IndexedAreasPanel({
                                     </label>
                                     <button
                                         type="button"
-                                        onClick={() => onDelete(area.id)}
+                                        onClick={e => {
+                                            e.stopPropagation()
+                                            onDelete(area.id)
+                                        }}
                                         className="text-[10px] text-gray-400 hover:text-rose-500 transition-colors"
                                     >
                                         Delete
