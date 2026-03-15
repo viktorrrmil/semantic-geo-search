@@ -27,5 +27,9 @@ func Register(r *gin.Engine) {
 		// Accepts an S3 path, region, bbox bounds, and "all" flag, then forwards
 		// the request to the main backend for asynchronous indexing.
 		v1.POST("/index-file", handlers.IndexFile)
+
+		// GET /api/v1/geo/indexed-areas
+		// Forwards indexed area metadata from the main backend.
+		v1.GET("/geo/indexed-areas", handlers.GetIndexedAreas)
 	}
 }
