@@ -1,13 +1,13 @@
 # semantic-geo-search
 
-Semantic Geo Search is an application layer for browsing spatial data, drawing geographic bounding boxes, and sending indexing/search requests to an external vector-search backend.
+Semantic Geo Search is the geo-facing part of Lynx. It gives you a map-based way to browse spatial data, draw bounding boxes, and launch indexing or search jobs against the Lynx backend.
 
-This repository contains two runnable parts:
+Together, this repo and Lynx form one system:
 
-- `backend/` — a Go API that proxies search and indexing requests, lists public S3 folders, and previews Parquet data with DuckDB.
-- `frontend/` — a React + TypeScript + Vite UI for map search and indexing.
+- `backend/` — the Go application layer that proxies requests into Lynx, lists public S3 folders, and previews Parquet data with DuckDB.
+- `frontend/` — the React + TypeScript + Vite interface for searching, selecting areas, and starting indexing.
 
-The actual vector-search engine is not included in this repo. The Go backend forwards the search and indexing work to that separate service.
+Lynx provides the search and indexing engine itself. This repository focuses on the user-facing workflow and the supporting API around it.
 
 ## What this project does
 
