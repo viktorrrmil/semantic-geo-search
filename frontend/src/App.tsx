@@ -300,67 +300,53 @@ function App() {
         setIndexedAreas(prev => prev.map(area => area.id === id ? {...area, active: area.active === false} : area))
     }
 
-    async function handleIndexSelection() {
+    function handleIndexSelection() {
         if (!selectedFile || !selectionBBox) return
-        setIndexStatus('loading')
         setIndexMsg('')
-        try {
-            const count = parseInt(rowCount, 10)
-            const files: FileItem[] = selectedFile.type === 'folder'
-                ? (selectedFile.files ?? [])
-                : [{path: selectedFile.path, name: selectedFile.name, region: selectedFile.region}]
+        const count = parseInt(rowCount, 10)
+        const files: FileItem[] = selectedFile.type === 'folder'
+            ? (selectedFile.files ?? [])
+            : [{path: selectedFile.path, name: selectedFile.name, region: selectedFile.region}]
 
-            if (files.length === 0) {
-                throw new Error('No files selected for indexing.')
-            }
-
-            let successCount = 0
-            let lastError = ''
-
-            for (const file of files) {
-                const payload: Record<string, unknown> = {
-                    s3_path: file.path,
-                    region: file.region,
-                    bbox_min_x: selectionBBox.minX,
-                    bbox_max_x: selectionBBox.maxX,
-                    bbox_min_y: selectionBBox.minY,
-                    bbox_max_y: selectionBBox.maxY,
-                    all: rowCount.trim() === '',
-                }
-                if (!isNaN(count) && rowCount.trim() !== '') {
-                    payload.count = count
-                }
-                try {
-                    const res = await fetch(`${API}/index-file`, {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify(payload),
-                    })
-                    if (!res.ok) throw new Error(`Server responded with ${res.status}`)
-                    successCount += 1
-                } catch (err) {
-                    lastError = err instanceof Error ? err.message : 'Failed to start indexing'
-                }
-            }
-
-            if (successCount === 0) {
-                throw new Error(lastError || 'Failed to start indexing')
-            }
-            if (successCount < files.length) {
-                setIndexMsg(`Indexed ${successCount}/${files.length} files. Last error: ${lastError}`)
-                setIndexStatus('error')
-            } else {
-                setIndexMsg(`Indexing started for ${successCount} file${successCount !== 1 ? 's' : ''}.`)
-                setIndexStatus('success')
-            }
-            await loadIndexedAreas()
-        } catch (err) {
-            setIndexMsg(err instanceof Error ? err.message : 'Failed to start indexing')
+        if (files.length === 0) {
+            setIndexMsg('No files selected for indexing.')
             setIndexStatus('error')
+            return
         }
+
+        setIndexStatus('success')
+        setIndexMsg('Indexing has started.')
+
+        for (const file of files) {
+            const payload: Record<string, unknown> = {
+                s3_path: file.path,
+                region: file.region,
+                bbox_min_x: selectionBBox.minX,
+                bbox_max_x: selectionBBox.maxX,
+                bbox_min_y: selectionBBox.minY,
+                bbox_max_y: selectionBBox.maxY,
+                all: rowCount.trim() === '',
+            }
+            if (!isNaN(count) && rowCount.trim() !== '') {
+                payload.count = count
+            }
+            void fetch(`${API}/index-file`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload),
+            }).then(res => {
+                if (!res.ok) throw new Error(`Server responded with ${res.status}`)
+            }).catch(err => {
+                console.error('Failed to start indexing', err)
+                setIndexStatus('error')
+                setIndexMsg('Indexing started, but one or more requests failed to start.')
+            })
+        }
+
+        void loadIndexedAreas()
     }
 
-    const canIndex = !!selectedFile && !!selectionBBox && indexStatus !== 'loading'
+    const canIndex = !!selectedFile && !!selectionBBox
 
     return (
         <div className="h-screen w-screen bg-[#f8f8f7]">
@@ -643,9 +629,7 @@ function App() {
                                 disabled={!canIndex}
                                 className="w-full py-2 text-sm bg-gray-800 text-white rounded-md hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                             >
-                                {indexStatus === 'loading'
-                                    ? 'Indexing…'
-                                    : `Index selection${selectedFile?.type === 'folder' ? ` (${selectedFile.files?.length ?? 0} files)` : ''}`}
+                                Index selection
                             </button>
                         </div>
                     </div>
