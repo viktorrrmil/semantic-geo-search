@@ -7,6 +7,7 @@ import './App.css'
 const API = 'http://localhost:3001/api/v1'
 const SEARCH_API = 'http://localhost:3001'
 const INDEXED_AREAS_API = 'http://localhost:3001/api/v1/geo/indexed-areas'
+const QUERY_EXPANSION_API = 'http://localhost:3001/api/v1/query-expansion'
 const DEFAULT_TOP_K = 5
 const TOP_K_PRESETS = [5, 10, 25, 50]
 
@@ -21,6 +22,17 @@ interface SearchResult {
     country?: string | null
     confidence?: number | null
     raw?: unknown
+}
+
+interface SearchResponseEnvelope {
+    expanded_query?: unknown
+    results?: unknown
+    rows?: unknown
+}
+
+interface QueryExpansionConfigResponse {
+    query_expansion_enabled?: unknown
+    enabled?: unknown
 }
 
 interface IndexedAreaRow {
@@ -95,6 +107,15 @@ function parseIndexedAreasResponse(data: unknown): IndexedArea[] {
         .filter((area): area is IndexedArea => area !== null)
 }
 
+function parseQueryExpansionEnabled(data: unknown): boolean {
+    if (data && typeof data === 'object') {
+        const payload = data as QueryExpansionConfigResponse
+        if (typeof payload.query_expansion_enabled === 'boolean') return payload.query_expansion_enabled
+        if (typeof payload.enabled === 'boolean') return payload.enabled
+    }
+    return false
+}
+
 function mergeActiveState(prev: IndexedArea[], next: IndexedArea[]) {
     if (prev.length === 0) return next
     const prevActive = new Map(prev.map(area => [area.id, area.active]))
@@ -119,6 +140,25 @@ function normalizeSearchResult(row: Record<string, unknown>, index: number): Sea
         confidence: typeof row.confidence === 'number' ? row.confidence : null,
         raw: row.raw,
     }
+}
+
+function parseSearchResultsResponse(data: unknown): {rows: Record<string, unknown>[], expandedQuery: string | null} {
+    if (Array.isArray(data)) {
+        return {rows: data as Record<string, unknown>[], expandedQuery: null}
+    }
+    if (data && typeof data === 'object') {
+        const payload = data as SearchResponseEnvelope
+        const expandedQuery = typeof payload.expanded_query === 'string' && payload.expanded_query.trim() !== ''
+            ? payload.expanded_query
+            : null
+        if (Array.isArray(payload.results)) {
+            return {rows: payload.results as Record<string, unknown>[], expandedQuery}
+        }
+        if (Array.isArray(payload.rows)) {
+            return {rows: payload.rows as Record<string, unknown>[], expandedQuery}
+        }
+    }
+    throw new Error('Unexpected response format')
 }
 
 function toSpatialFeature(row: SearchResult): SpatialFeature {
@@ -167,6 +207,9 @@ function App() {
     const [indexedAreasError, setIndexedAreasError] = useState('')
     const [selectedIndexedAreaId, setSelectedIndexedAreaId] = useState<string | null>(null)
     const [searchQuery, setSearchQuery] = useState('')
+    const [queryExpansionAvailable, setQueryExpansionAvailable] = useState(false)
+    const [queryExpansionEnabled, setQueryExpansionEnabled] = useState(false)
+    const [expandedQuery, setExpandedQuery] = useState<string | null>(null)
     const [topK, setTopK] = useState(String(DEFAULT_TOP_K))
     const [showTopKMenu, setShowTopKMenu] = useState(false)
     const [searchStatus, setSearchStatus] = useState<Status>('idle')
@@ -217,6 +260,24 @@ function App() {
         return () => controller.abort()
     }, [])
 
+    useEffect(() => {
+        const controller = new AbortController()
+        void loadQueryExpansionConfig(controller.signal)
+        return () => controller.abort()
+    }, [])
+
+    useEffect(() => {
+        if (!queryExpansionAvailable) {
+            setQueryExpansionEnabled(false)
+        }
+    }, [queryExpansionAvailable])
+
+    useEffect(() => {
+        if (!queryExpansionEnabled) {
+            setExpandedQuery(null)
+        }
+    }, [queryExpansionEnabled])
+
     async function loadIndexedAreas(signal?: AbortSignal) {
         setIndexedAreasStatus('loading')
         setIndexedAreasError('')
@@ -234,6 +295,17 @@ function App() {
         }
     }
 
+    async function loadQueryExpansionConfig(signal?: AbortSignal) {
+        try {
+            const res = await fetch(QUERY_EXPANSION_API, {signal})
+            if (!res.ok) return
+            const data: unknown = await res.json()
+            setQueryExpansionAvailable(parseQueryExpansionEnabled(data))
+        } catch {
+            // Silently ignore; query expansion stays hidden/disabled.
+        }
+    }
+
     async function handleSearchSubmit(e: FormEvent) {
         e.preventDefault()
         const query = searchQuery.trim()
@@ -247,33 +319,28 @@ function App() {
         setSearchError('')
         setSelectedResultId(null)
         setFocusedFeature(null)
+        setExpandedQuery(null)
         try {
-            console.log(`Searching for "${query}" with topK=${resolveTopK(topK)}...`)
             const resolvedTopK = resolveTopK(topK)
+            const useQueryExpansion = queryExpansionAvailable && queryExpansionEnabled
+            console.log(`Searching for "${query}" with topK=${resolvedTopK}...`)
             const res = await fetch(`${SEARCH_API}/search`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
                     query,
                     count: resolvedTopK,
+                    ...(useQueryExpansion ? {expand: true} : {}),
                 }),
             })
             if (!res.ok) throw new Error(`Server responded with ${res.status}`)
             const data: unknown = await res.json()
-            const rows = Array.isArray(data)
-                ? data
-                : (data && typeof data === 'object' && Array.isArray((data as {results?: unknown}).results))
-                    ? (data as {results: unknown[]}).results
-                    : (data && typeof data === 'object' && Array.isArray((data as {rows?: unknown}).rows))
-                        ? (data as {rows: unknown[]}).rows
-                        : null
-            if (!rows) {
-                throw new Error('Unexpected response format')
-            }
+            const {rows, expandedQuery: responseExpandedQuery} = parseSearchResultsResponse(data)
             const parsed = rows.map((row, index) => normalizeSearchResult(row as Record<string, unknown>, index))
             const trimmed = parsed.slice(0, resolvedTopK)
             const mapped = trimmed.map(toSpatialFeature)
-            console.log("Search results:", trimmed)
+            setExpandedQuery(useQueryExpansion ? responseExpandedQuery : null)
+            console.log('Search results:', trimmed)
             setSearchResults(trimmed)
             setSearchFeatures(mapped)
             setSearchStatus('success')
@@ -281,6 +348,7 @@ function App() {
             setSearchError(err instanceof Error ? err.message : 'Search failed')
             setSearchResults([])
             setSearchFeatures([])
+            setExpandedQuery(null)
             setSearchStatus('error')
         }
     }
@@ -292,6 +360,7 @@ function App() {
         setSearchFeatures([])
         setSelectedResultId(null)
         setFocusedFeature(null)
+        setExpandedQuery(null)
         setShowTopKMenu(false)
         setSearchStatus('idle')
     }
@@ -371,7 +440,8 @@ function App() {
                     </div>
 
                     <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 max-w-[90vw]">
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-col items-center gap-2">
+                            <div className="flex items-center gap-2">
                             <form
                                 onSubmit={handleSearchSubmit}
                                 className="flex items-center gap-2 bg-white/90 border border-gray-200 rounded-full shadow-sm px-3 py-2 w-[420px] max-w-[70vw]"
@@ -444,6 +514,33 @@ function App() {
                                 </div>
                             </div>
                             </div>
+                            </div>
+                            {queryExpansionAvailable && (
+                                <div className="flex items-center gap-2 text-[11px] text-gray-500">
+                                    <label className="flex items-center gap-1.5 cursor-pointer select-none">
+                                        <input
+                                            type="checkbox"
+                                            checked={queryExpansionEnabled}
+                                            onChange={e => setQueryExpansionEnabled(e.target.checked)}
+                                            className="accent-teal-600"
+                                        />
+                                        <span>Query Expansion</span>
+                                    </label>
+                                    <button
+                                        type="button"
+                                        title="Rewrites your query into a richer description before search to improve recall."
+                                        aria-label="Query expansion help"
+                                        className="h-4 w-4 rounded-full border border-gray-200 text-[9px] leading-none text-gray-400 hover:text-gray-600 hover:border-gray-300 transition-colors"
+                                    >
+                                        i
+                                    </button>
+                                </div>
+                            )}
+                            {searchStatus === 'success' && expandedQuery && (
+                                <p className="text-[11px] text-gray-400 text-center max-w-[70vw] truncate">
+                                    Searched for: <span className="text-gray-600">"{expandedQuery}"</span>
+                                </p>
+                            )}
                         </div>
                         {searchError && (
                             <p className="mt-2 text-[11px] text-rose-500 text-center">{searchError}</p>

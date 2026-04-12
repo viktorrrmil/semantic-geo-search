@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,10 +12,26 @@ import (
 
 const searchEndpointPath = "/semantic-geo-search/"
 
-func ForwardSearchRequest(ctx context.Context, payload []byte) (int, []byte, error) {
+func ForwardSearchRequest(ctx context.Context, payload map[string]any) (int, []byte, error) {
+	expandedQuery := ""
+	if expand, ok := payload["expand"].(bool); ok && expand {
+		query, _ := payload["query"].(string)
+		expandedQuery = strings.TrimSpace(query)
+		if nextQuery, err := ExpandQuery(query); err == nil && strings.TrimSpace(nextQuery) != "" {
+			expandedQuery = nextQuery
+		}
+		payload["query"] = expandedQuery
+	}
+	delete(payload, "expand")
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to marshal search payload: %w", err)
+	}
+
 	targetURL := mainBackendURL() + searchEndpointPath
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, fmt.Errorf("failed to build search request: %w", err)
 	}
@@ -26,8 +43,17 @@ func ForwardSearchRequest(ctx context.Context, payload []byte) (int, []byte, err
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
-	return resp.StatusCode, body, nil
+	respBody, _ := io.ReadAll(resp.Body)
+	if expandedQuery != "" && json.Valid(respBody) {
+		wrapped, err := json.Marshal(struct {
+			ExpandedQuery string          `json:"expanded_query"`
+			Results       json.RawMessage `json:"results"`
+		}{ExpandedQuery: expandedQuery, Results: respBody})
+		if err == nil {
+			return resp.StatusCode, wrapped, nil
+		}
+	}
+	return resp.StatusCode, respBody, nil
 }
 
 func NormalizeSearchPayload(payload map[string]any) (map[string]any, error) {
@@ -45,6 +71,11 @@ func NormalizeSearchPayload(payload map[string]any) (map[string]any, error) {
 	}
 	if count, ok := payload["count"]; ok && !isJSONNumber(count) {
 		return nil, fmt.Errorf("count must be a number")
+	}
+	if rawExpand, ok := payload["expand"]; ok {
+		if _, ok := rawExpand.(bool); !ok {
+			return nil, fmt.Errorf("expand must be a boolean")
+		}
 	}
 
 	return payload, nil

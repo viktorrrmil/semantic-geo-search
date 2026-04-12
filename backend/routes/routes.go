@@ -11,6 +11,10 @@ func Register(r *gin.Engine) {
 
 	v1 := r.Group("/api/v1")
 	{
+		// GET /api/v1/query-expansion
+		// Reports whether query expansion is enabled on the backend.
+		v1.GET("/query-expansion", handlers.SearchConfig)
+
 		// GET /api/v1/list-files/*url
 		// Lists immediate children of an S3 bucket/prefix.
 		// Examples:

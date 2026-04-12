@@ -33,7 +33,7 @@ func Search(c *gin.Context) {
 		return
 	}
 
-	status, respBody, err := services.ForwardSearchRequest(c.Request.Context(), body)
+	status, respBody, err := services.ForwardSearchRequest(c.Request.Context(), payload)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "search request failed: " + err.Error()})
 		return
