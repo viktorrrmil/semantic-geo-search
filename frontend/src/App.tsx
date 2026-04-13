@@ -439,120 +439,155 @@ function App() {
                         </button>
                     </div>
 
-                    <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 max-w-[90vw]">
-                        <div className="flex flex-col items-center gap-2">
-                            <div className="flex items-center gap-2">
-                            <form
-                                onSubmit={handleSearchSubmit}
-                                className="flex items-center gap-2 bg-white/90 border border-gray-200 rounded-full shadow-sm px-3 py-2 w-[420px] max-w-[70vw]"
-                            >
-                            <input
-                                type="text"
-                                value={searchQuery}
-                                onChange={e => setSearchQuery(e.target.value)}
-                                placeholder="Search across indexed areas"
-                                className="flex-1 bg-transparent text-sm text-gray-700 placeholder-gray-400 outline-none"
-                            />
-                            {searchQuery && (
-                                <button
-                                    type="button"
-                                    onClick={handleSearchClear}
-                                    className="text-gray-300 hover:text-gray-500 transition-colors"
-                                >
-                                    ✕
-                                </button>
-                            )}
-                            <button
-                                type="submit"
-                                disabled={!searchQuery.trim() || searchStatus === 'loading'}
-                                className="text-[11px] font-medium text-white bg-gray-800 px-3 py-1.5 rounded-full hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-                            >
-                                {searchStatus === 'loading' ? 'Searching…' : 'Search'}
-                            </button>
-                            </form>
-                            <div className="relative" ref={topKMenuRef}>
-                            <button
-                                type="button"
-                                onClick={() => setShowTopKMenu(v => !v)}
-                                className="h-9 w-9 rounded-full bg-white/90 border border-gray-200 shadow-sm text-gray-400 hover:text-gray-600 transition-colors flex items-center justify-center"
-                                aria-label="Search options"
-                                aria-expanded={showTopKMenu}
-                            >
-                                ⋯
-                            </button>
-                            <div
-                                className={`absolute right-0 mt-2 w-44 bg-white border border-gray-200 rounded-md shadow-md z-50 transition-all duration-200 origin-top-right ${
-                                    showTopKMenu
-                                        ? 'opacity-100 scale-100 translate-y-0'
-                                        : 'opacity-0 scale-95 -translate-y-1 pointer-events-none'
-                                }`}
-                            >
-                                <div className="px-3 py-2 border-b border-gray-100">
-                                    <p className="text-[10px] text-gray-400 mb-1">Top K</p>
+                    <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 w-[min(860px,90vw)]">
+                        <div className="rounded-2xl border border-gray-200/80 bg-white/95 px-3 py-3 shadow-xl backdrop-blur-sm">
+                            <form onSubmit={handleSearchSubmit} className="flex flex-col gap-2.5 xl:flex-row xl:items-center">
+                                <div className="flex flex-1 items-center gap-2 rounded-xl border border-gray-200 bg-gray-50/80 px-3 py-2.5 shadow-sm transition-colors focus-within:border-gray-300 focus-within:bg-white">
+                                    <svg className="h-4 w-4 shrink-0 text-gray-400" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                                        <circle cx="8.5" cy="8.5" r="5.75" stroke="currentColor" strokeWidth="1.5" />
+                                        <path d="M12.5 12.5L16 16" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                                    </svg>
                                     <input
-                                        type="number"
-                                        min={1}
-                                        value={topK}
-                                        onChange={e => setTopK(e.target.value)}
-                                        className="w-full text-[11px] bg-gray-50 border border-gray-200 rounded px-2 py-1 text-gray-700 outline-none focus:border-gray-300"
+                                        type="text"
+                                        value={searchQuery}
+                                        onChange={e => setSearchQuery(e.target.value)}
+                                        placeholder="Search across indexed areas"
+                                        className="min-w-0 flex-1 bg-transparent text-sm text-gray-800 placeholder-gray-400 outline-none"
                                     />
-                                </div>
-                                <div className="p-2 flex flex-wrap gap-1.5">
-                                    {TOP_K_PRESETS.map(k => (
+                                    {searchQuery && (
                                         <button
-                                            key={k}
                                             type="button"
-                                            onClick={() => {
-                                                setTopK(String(k))
-                                                setShowTopKMenu(false)
-                                            }}
-                                            className="text-[10px] text-gray-600 border border-gray-200 rounded px-2 py-1 hover:bg-gray-50"
+                                            onClick={handleSearchClear}
+                                            className="rounded-full p-1 text-gray-300 transition-colors hover:bg-gray-100 hover:text-gray-500"
+                                            aria-label="Clear search query"
                                         >
-                                            {k}
+                                            ✕
                                         </button>
-                                    ))}
+                                    )}
                                 </div>
-                            </div>
-                            </div>
-                            </div>
-                            {queryExpansionAvailable && (
-                                <div className="flex items-center gap-2 text-[11px] text-gray-500">
-                                    <label className="flex items-center gap-1.5 cursor-pointer select-none">
-                                        <input
-                                            type="checkbox"
-                                            checked={queryExpansionEnabled}
-                                            onChange={e => setQueryExpansionEnabled(e.target.checked)}
-                                            className="accent-teal-600"
-                                        />
-                                        <span>Query Expansion</span>
-                                    </label>
+
+                                <div className="flex items-center gap-2 self-stretch xl:self-auto">
+                                    <div className="relative" ref={topKMenuRef}>
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowTopKMenu(v => !v)}
+                                            className="inline-flex h-10 min-w-24 items-center justify-between gap-2 rounded-xl border border-gray-200 bg-white px-3 text-sm font-medium text-gray-700 shadow-sm transition-colors hover:border-gray-300 hover:bg-gray-50"
+                                            aria-label="Set result count"
+                                            aria-expanded={showTopKMenu}
+                                        >
+                                            <span className="text-[9px] font-semibold uppercase tracking-[0.18em] text-gray-400">Top K</span>
+                                            <span>{resolveTopK(topK)}</span>
+                                            <span className={`text-gray-400 transition-transform ${showTopKMenu ? 'rotate-180' : ''}`}>▾</span>
+                                        </button>
+                                        <div
+                                            className={`absolute right-0 z-50 mt-2 w-48 origin-top-right rounded-2xl border border-gray-200 bg-white shadow-xl transition-all duration-200 ${
+                                                showTopKMenu
+                                                    ? 'translate-y-0 scale-100 opacity-100'
+                                                    : '-translate-y-1 scale-95 opacity-0 pointer-events-none'
+                                            }`}
+                                        >
+                                            <div className="border-b border-gray-100 px-3 py-3">
+                                                <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-gray-400">Result count</p>
+                                                <div className="mt-2 flex items-center gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2">
+                                                    <input
+                                                        type="number"
+                                                        min={1}
+                                                        value={topK}
+                                                        onChange={e => setTopK(e.target.value)}
+                                                        className="w-full bg-transparent text-sm text-gray-700 outline-none"
+                                                    />
+                                                </div>
+                                            </div>
+                                            <div className="p-3">
+                                                <p className="mb-2 text-[10px] uppercase tracking-[0.18em] text-gray-400">Quick picks</p>
+                                                <div className="flex flex-wrap gap-2">
+                                                    {TOP_K_PRESETS.map(k => (
+                                                        <button
+                                                            key={k}
+                                                            type="button"
+                                                            onClick={() => {
+                                                                setTopK(String(k))
+                                                                setShowTopKMenu(false)
+                                                            }}
+                                                            className="rounded-full border border-gray-200 px-3 py-1.5 text-xs font-medium text-gray-600 transition-colors hover:border-gray-300 hover:bg-gray-50"
+                                                        >
+                                                            {k}
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
                                     <button
-                                        type="button"
-                                        title="Rewrites your query into a richer description before search to improve recall."
-                                        aria-label="Query expansion help"
-                                        className="h-4 w-4 rounded-full border border-gray-200 text-[9px] leading-none text-gray-400 hover:text-gray-600 hover:border-gray-300 transition-colors"
+                                        type="submit"
+                                        disabled={!searchQuery.trim() || searchStatus === 'loading'}
+                                        className="inline-flex h-10 items-center justify-center rounded-xl bg-gray-900 px-4 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-40"
                                     >
-                                        i
+                                        {searchStatus === 'loading' ? 'Searching…' : 'Search'}
                                     </button>
                                 </div>
-                            )}
-                            {searchStatus === 'success' && expandedQuery && (
-                                <p className="text-[11px] text-gray-400 text-center max-w-[70vw] truncate">
-                                    Searched for: <span className="text-gray-600">"{expandedQuery}"</span>
-                                </p>
-                            )}
+                            </form>
+
+                            <div className="mt-2 flex flex-col gap-2">
+                                {queryExpansionAvailable && (
+                                    <label
+                                        className={`flex cursor-pointer items-center justify-between gap-3 rounded-xl border px-3 py-1.5 transition-colors ${
+                                            queryExpansionEnabled
+                                                ? 'border-slate-300 bg-slate-50'
+                                                : 'border-slate-200 bg-white hover:border-slate-300'
+                                        }`}
+                                    >
+                                        <span className="min-w-0 flex-1 text-xs font-medium text-slate-700">Expand search</span>
+                                        <span className="relative h-5 w-9 shrink-0">
+                                            <input
+                                                type="checkbox"
+                                                checked={queryExpansionEnabled}
+                                                onChange={e => setQueryExpansionEnabled(e.target.checked)}
+                                                className="peer sr-only"
+                                                aria-label="Enable query expansion"
+                                            />
+                                            <span className="absolute inset-0 rounded-full border border-slate-300 bg-white shadow-sm transition-colors duration-200 peer-checked:border-slate-700 peer-checked:bg-slate-700" />
+                                            <span className="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
+                                        </span>
+                                    </label>
+                                )}
+
+                                {searchStatus === 'success' && expandedQuery && (
+                                    <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/80 px-3 py-2">
+                                        <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+                                            Expanded
+                                        </span>
+                                        <p className="min-w-0 flex-1 truncate text-[11px] leading-relaxed text-slate-700">
+                                            “{expandedQuery}”
+                                        </p>
+                                    </div>
+                                )}
+                            </div>
                         </div>
                         {searchError && (
-                            <p className="mt-2 text-[11px] text-rose-500 text-center">{searchError}</p>
+                            <p className="mt-2 text-center text-[11px] text-rose-500">{searchError}</p>
                         )}
                     </div>
-                    <div className="absolute top-4 left-4 z-30 w-80 max-w-[85vw] flex flex-col gap-3">
-                        <div className="bg-white/90 border border-gray-200 rounded-lg shadow-sm flex flex-col overflow-hidden max-h-[55vh] min-h-[220px]">
-                            <div className="px-4 py-2.5 border-b border-gray-100">
-                                <p className="text-[11px] text-gray-400">Search results</p>
-                                <p className="text-xs text-gray-600">
-                                    Top {resolveTopK(topK)} results
-                                </p>
+                        <div className="absolute top-4 left-4 z-30 w-80 max-w-[85vw] flex flex-col gap-3">
+                            <div className="bg-white/90 border border-gray-200 rounded-lg shadow-sm flex flex-col overflow-hidden max-h-[55vh] min-h-55">
+                            <div className="px-4 py-3 border-b border-gray-100">
+                                <div className="flex items-start justify-between gap-3">
+                                    <div>
+                                        <p className="text-[11px] text-gray-400">Search results</p>
+                                        <p className="text-xs text-gray-600">Top {resolveTopK(topK)} results</p>
+                                    </div>
+                                    {searchStatus === 'success' && expandedQuery && (
+                                        <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium uppercase tracking-[0.14em] text-slate-500">
+                                            Expanded
+                                        </span>
+                                    )}
+                                </div>
+                                {searchStatus === 'success' && expandedQuery && (
+                                    <p className="mt-2 max-h-14 overflow-hidden rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2 text-[11px] leading-relaxed text-slate-700">
+                                        “{expandedQuery}”
+                                    </p>
+                                )}
                             </div>
                             <div className="flex-1 overflow-y-auto min-h-0">
                                 {searchStatus === 'idle' && (

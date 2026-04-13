@@ -7,16 +7,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"net/url"
 	"strings"
 	"time"
+
+	"examle.com/mod/config"
 )
 
 const (
-	anthropicMessagesURL    = "https://api.anthropic.com/v1/messages"
-	queryExpansionModel     = "claude-sonnet-4-20250514"
+	geminiAPIBaseURL        = "https://generativelanguage.googleapis.com/v1beta/models"
+	queryExpansionModel     = "gemini-2.5-flash"
 	queryExpansionTimeout   = 5 * time.Second
-	anthropicAPIVersion     = "2023-06-01"
 	queryExpansionMaxTokens = 150
 )
 
@@ -26,100 +27,98 @@ const queryExpansionSystemPrompt = `You are a query expansion assistant for a se
       Return only the expanded query, nothing else. No explanations,
       no preamble, no quotation marks.`
 
-type anthropicMessage struct {
-	Role    string             `json:"role"`
-	Content []anthropicContent `json:"content"`
-}
-
-type anthropicContent struct {
-	Type string `json:"type"`
+type geminiPart struct {
 	Text string `json:"text"`
 }
 
-type anthropicMessagesRequest struct {
-	Model     string             `json:"model"`
-	MaxTokens int                `json:"max_tokens"`
-	System    string             `json:"system"`
-	Messages  []anthropicMessage `json:"messages"`
+type geminiContent struct {
+	Role  string       `json:"role,omitempty"`
+	Parts []geminiPart `json:"parts"`
 }
 
-type anthropicMessagesResponse struct {
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
+type geminiGenerationConfig struct {
+	MaxOutputTokens int `json:"maxOutputTokens"`
 }
 
-var anthropicHTTPClient = &http.Client{Timeout: queryExpansionTimeout}
+type geminiGenerateContentRequest struct {
+	SystemInstruction geminiContent          `json:"system_instruction"`
+	Contents          []geminiContent        `json:"contents"`
+	GenerationConfig  geminiGenerationConfig `json:"generationConfig"`
+}
+
+type geminiGenerateContentResponse struct {
+	Candidates []struct {
+		Content geminiContent `json:"content"`
+	} `json:"candidates"`
+}
+
+var geminiHTTPClient = &http.Client{Timeout: queryExpansionTimeout}
 
 func QueryExpansionEnabled() bool {
-	return strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")) != ""
+	return strings.TrimSpace(config.Current().GeminiAPIKey) != ""
 }
 
 func ExpandQuery(query string) (string, error) {
 	original := strings.TrimSpace(query)
-	apiKey := strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY"))
+	apiKey := strings.TrimSpace(config.Current().GeminiAPIKey)
 	if original == "" {
 		return query, fmt.Errorf("query must be a non-empty string")
 	}
 	if apiKey == "" {
-		return query, fmt.Errorf("anthropic api key is not configured")
+		return query, fmt.Errorf("gemini api key is not configured")
 	}
 
-	payload := anthropicMessagesRequest{
-		Model:     queryExpansionModel,
-		MaxTokens: queryExpansionMaxTokens,
-		System:    queryExpansionSystemPrompt,
-		Messages: []anthropicMessage{{
-			Role: "user",
-			Content: []anthropicContent{{
-				Type: "text",
-				Text: fmt.Sprintf("Expand this search query for semantic search: %s", original),
-			}},
+	payload := geminiGenerateContentRequest{
+		SystemInstruction: geminiContent{Parts: []geminiPart{{Text: queryExpansionSystemPrompt}}},
+		Contents: []geminiContent{{
+			Role:  "user",
+			Parts: []geminiPart{{Text: fmt.Sprintf("Expand this search query for semantic search: %s", original)}},
 		}},
+		GenerationConfig: geminiGenerationConfig{MaxOutputTokens: queryExpansionMaxTokens},
 	}
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return query, fmt.Errorf("failed to marshal anthropic request: %w", err)
+		return query, fmt.Errorf("failed to marshal gemini request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, anthropicMessagesURL, bytes.NewReader(body))
+	endpoint := fmt.Sprintf("%s/%s:generateContent?key=%s", geminiAPIBaseURL, queryExpansionModel, url.QueryEscape(apiKey))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return query, fmt.Errorf("failed to build anthropic request: %w", err)
+		return query, fmt.Errorf("failed to build gemini request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
-	req.Header.Set("anthropic-version", anthropicAPIVersion)
 
-	resp, err := anthropicHTTPClient.Do(req)
+	resp, err := geminiHTTPClient.Do(req)
 	if err != nil {
-		return query, fmt.Errorf("anthropic request failed: %w", err)
+		return query, fmt.Errorf("gemini request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return query, fmt.Errorf("failed to read anthropic response: %w", err)
+		return query, fmt.Errorf("failed to read gemini response: %w", err)
 	}
 	if resp.StatusCode >= http.StatusMultipleChoices {
-		return query, fmt.Errorf("anthropic request returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return query, fmt.Errorf("gemini request returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
-	var parsed anthropicMessagesResponse
+	var parsed geminiGenerateContentResponse
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return query, fmt.Errorf("failed to parse anthropic response: %w", err)
+		return query, fmt.Errorf("failed to parse gemini response: %w", err)
 	}
 
 	var expandedParts []string
-	for _, part := range parsed.Content {
-		if strings.EqualFold(part.Type, "text") && strings.TrimSpace(part.Text) != "" {
-			expandedParts = append(expandedParts, part.Text)
+	for _, candidate := range parsed.Candidates {
+		for _, part := range candidate.Content.Parts {
+			if strings.TrimSpace(part.Text) != "" {
+				expandedParts = append(expandedParts, part.Text)
+			}
 		}
 	}
 	expanded := strings.TrimSpace(strings.Join(expandedParts, ""))
 	if expanded == "" {
-		return query, fmt.Errorf("anthropic returned an empty expansion")
+		return query, fmt.Errorf("gemini returned an empty expansion")
 	}
 
 	return expanded, nil

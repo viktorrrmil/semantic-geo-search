@@ -704,14 +704,6 @@ export default function MapView({
                 }}
             />
 
-            {/* Feature count overlay */}
-            {safeFeatures.length > 0 && (
-                <div className="absolute top-2 left-1/2 -translate-x-1/2 pointer-events-none">
-          <span className="text-[10px] text-gray-600 bg-white/90 px-2.5 py-1 rounded shadow-sm whitespace-nowrap">
-            {safeFeatures.length} feature{safeFeatures.length !== 1 ? 's' : ''} loaded
-          </span>
-                </div>
-            )}
 
             {/* Map attribution */}
             <div
