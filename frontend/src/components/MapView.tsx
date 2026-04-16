@@ -38,6 +38,7 @@ interface Props {
     dimMap?: boolean
     selectionBBox?: BBox | null
     onSelectionChange?: (bbox: BBox | null) => void
+    onViewStateChange?: (viewState: MapViewState) => void
     drawMode?: 'none' | 'shift' | 'always'
     focusedFeature?: SpatialFeature | null
     focusedBBox?: BBox | null
@@ -356,6 +357,20 @@ function resolveSubtitle(feature: SpatialFeature): string {
     return ''
 }
 
+function resolveFinalScore(feature: SpatialFeature): number {
+    const value = feature.properties.final_score
+    return typeof value === 'number' && Number.isFinite(value)
+        ? Math.max(0, Math.min(1, value))
+        : 0
+}
+
+function scoreColor(score: number): [number, number, number, number] {
+    const alpha = 110 + Math.round(score * 140)
+    if (score > 0.8) return [34, 197, 94, alpha]
+    if (score >= 0.5) return [234, 179, 8, alpha]
+    return [148, 163, 184, alpha]
+}
+
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function MapView({
@@ -364,6 +379,7 @@ export default function MapView({
                                      dimMap = false,
                                      selectionBBox,
                                      onSelectionChange,
+                                     onViewStateChange,
                                      drawMode = 'none',
                                      focusedFeature = null,
                                      focusedBBox = null,
@@ -378,6 +394,14 @@ export default function MapView({
     const [dragCurrent, setDragCurrent] = useState<[number, number] | null>(null)
 
     const safeFeatures = useMemo(() => features ?? [], [features])
+
+    const publishViewState = useMemo(() => {
+        return (next: MapViewState) => {
+            vsRef.current = next
+            setViewState(next)
+            onViewStateChange?.(next)
+        }
+    }, [onViewStateChange])
 
     useEffect(() => {
         const el = containerRef.current
@@ -403,11 +427,10 @@ export default function MapView({
             const vp = new WebMercatorViewport({width: w, height: h})
             const {longitude, latitude, zoom} = vp.fitBounds(bbox, {padding: 60})
             const next = {...vsRef.current, longitude, latitude, zoom: Math.min(zoom, 18)}
-            vsRef.current = next
-            setViewState(next)
+            publishViewState(next)
         } catch { /* fitBounds can throw for degenerate bbox */
         }
-    }, [safeFeatures])
+    }, [publishViewState, safeFeatures])
 
     // Fly to a focused feature when selected
     useEffect(() => {
@@ -440,10 +463,9 @@ export default function MapView({
                 transitionDuration: 1200,
                 transitionInterpolator: new FlyToInterpolator({speed: 1.6}),
             }
-            vsRef.current = next
-            setViewState(next)
+            publishViewState(next)
         } catch { /* ignore fit errors */ }
-    }, [focusedFeature, size.width, size.height])
+    }, [focusedFeature, publishViewState, size.width, size.height])
 
     // Fly to a focused bbox (indexed area)
     useEffect(() => {
@@ -462,10 +484,9 @@ export default function MapView({
                 transitionDuration: 1200,
                 transitionInterpolator: new FlyToInterpolator({speed: 1.6}),
             }
-            vsRef.current = next
-            setViewState(next)
+            publishViewState(next)
         } catch { /* ignore fit errors */ }
-    }, [focusedBBox, size.width, size.height])
+    }, [focusedBBox, publishViewState, size.width, size.height])
 
     const {points, polys, paths} = categorize(safeFeatures)
 
@@ -474,9 +495,9 @@ export default function MapView({
             id: 'points',
             data: points,
             getPosition: d => d.pos,
-            getRadius: 6,
+            getRadius: d => 5 + resolveFinalScore(d.feature) * 11,
             radiusUnits: 'pixels',
-            getFillColor: [59, 130, 246, 210],
+            getFillColor: d => scoreColor(resolveFinalScore(d.feature)),
             getLineColor: [255, 255, 255, 180],
             lineWidthMinPixels: 1.5,
             stroked: true,
@@ -653,8 +674,7 @@ export default function MapView({
                 viewState={viewState}
                 onViewStateChange={({viewState: vs}) => {
                     const next = clampViewState(vs as MapViewState)
-                    vsRef.current = next
-                    setViewState(next)
+                    publishViewState(next)
                 }}
                 controller={{
                     dragPan: !isDrawing,

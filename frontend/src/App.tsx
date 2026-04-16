@@ -10,6 +10,9 @@ const INDEXED_AREAS_API = 'http://localhost:3001/api/v1/geo/indexed-areas'
 const QUERY_EXPANSION_API = 'http://localhost:3001/api/v1/query-expansion'
 const DEFAULT_TOP_K = 5
 const TOP_K_PRESETS = [5, 10, 25, 50]
+const DEFAULT_HYBRID_ALPHA = 0.7
+const DEFAULT_DECAY_RADIUS_KM = 5
+const INITIAL_MAP_CENTER = {latitude: 20, longitude: 0}
 
 type Page = 'main' | 'index'
 type Status = 'idle' | 'loading' | 'success' | 'error'
@@ -21,6 +24,10 @@ interface SearchResult {
     category?: string | null
     country?: string | null
     confidence?: number | null
+    distance?: number | null
+    semantic_score?: number | null
+    geo_score?: number | null
+    final_score?: number | null
     raw?: unknown
 }
 
@@ -55,7 +62,7 @@ interface IndexedAreaRow {
 
 function isGeoJSONGeometry(value: unknown): value is GeoJSONGeometry {
     return typeof value === 'object' && value !== null
-        && 'type' in value && typeof (value as GeoJSONGeometry).type === 'string'
+        && 'type' in value
         && 'coordinates' in value
 }
 
@@ -131,14 +138,23 @@ function normalizeSearchResult(row: Record<string, unknown>, index: number): Sea
     const geom = typeof row.geom === 'string'
         ? row.geom
         : (isGeoJSONGeometry(row.geom) ? row.geom : '')
+    const confidence = toNumber(row.confidence)
+    const distance = toNumber(row.distance)
+    const semanticScore = toNumber(row.semantic_score)
+    const geoScore = toNumber(row.geo_score)
+    const finalScore = toNumber(row.final_score)
     return {
         id: id || `row-${index}`,
         embed_text: typeof row.embed_text === 'string' ? row.embed_text : '',
         geom,
         category: typeof row.category === 'string' ? row.category : null,
         country: typeof row.country === 'string' ? row.country : null,
-        confidence: typeof row.confidence === 'number' ? row.confidence : null,
-        raw: row.raw,
+        confidence,
+        distance,
+        semantic_score: semanticScore,
+        geo_score: geoScore,
+        final_score: finalScore,
+        raw: row.raw ?? row,
     }
 }
 
@@ -170,6 +186,10 @@ function toSpatialFeature(row: SearchResult): SpatialFeature {
     if (row.category) props.category = row.category
     if (row.country) props.country = row.country
     if (row.confidence != null) props.confidence = row.confidence
+    if (row.distance != null) props.distance = row.distance
+    if (row.semantic_score != null) props.semantic_score = row.semantic_score
+    if (row.geo_score != null) props.geo_score = row.geo_score
+    if (row.final_score != null) props.final_score = row.final_score
     if (row.raw != null) props.raw = row.raw
     return {
         geometry: row.geom ?? '',
@@ -186,6 +206,44 @@ function formatConfidence(value: number | null | undefined) {
     if (value == null || Number.isNaN(value)) return null
     const pct = value <= 1 ? Math.round(value * 100) : Math.round(value)
     return `${pct}%`
+}
+
+function formatScore(value: number | null | undefined) {
+    if (value == null || Number.isNaN(value)) return '—'
+    return value.toFixed(2)
+}
+
+function scoreTone(score: number | null | undefined) {
+    if (score == null || Number.isNaN(score)) {
+        return {
+            badge: 'bg-gray-100 text-gray-500 border-gray-200',
+            fill: 'bg-gray-300',
+        }
+    }
+    if (score > 0.8) {
+        return {
+            badge: 'bg-emerald-100 text-emerald-700 border-emerald-200',
+            fill: 'bg-emerald-500',
+        }
+    }
+    if (score >= 0.5) {
+        return {
+            badge: 'bg-amber-100 text-amber-700 border-amber-200',
+            fill: 'bg-amber-500',
+        }
+    }
+    return {
+        badge: 'bg-slate-100 text-slate-500 border-slate-200',
+        fill: 'bg-slate-400',
+    }
+}
+
+function clamp01(value: number) {
+    return Math.max(0, Math.min(1, value))
+}
+
+function resolveFinalScore(result: SearchResult) {
+    return clamp01(result.final_score ?? result.semantic_score ?? 0)
 }
 
 function resolveIndexedPercent(area: IndexedArea): number | null {
@@ -212,6 +270,12 @@ function App() {
     const [expandedQuery, setExpandedQuery] = useState<string | null>(null)
     const [topK, setTopK] = useState(String(DEFAULT_TOP_K))
     const [showTopKMenu, setShowTopKMenu] = useState(false)
+    const [mapCenter, setMapCenter] = useState(INITIAL_MAP_CENTER)
+    const [hybridRankingEnabled, setHybridRankingEnabled] = useState(true)
+    const [showHybridControls, setShowHybridControls] = useState(true)
+    const [hybridAlpha, setHybridAlpha] = useState(DEFAULT_HYBRID_ALPHA)
+    const [hybridDecayRadiusKm, setHybridDecayRadiusKm] = useState(DEFAULT_DECAY_RADIUS_KM)
+    const [hybridCategory, setHybridCategory] = useState('')
     const [searchStatus, setSearchStatus] = useState<Status>('idle')
     const [searchError, setSearchError] = useState('')
     const [searchResults, setSearchResults] = useState<SearchResult[]>([])
@@ -234,56 +298,19 @@ function App() {
     const selectedIndexedArea = selectedIndexedAreaId
         ? indexedAreas.find(area => area.id === selectedIndexedAreaId) ?? null
         : null
-
-    useEffect(() => {
-        if (!showTopKMenu) return
-        const handler = (event: MouseEvent) => {
-            if (!topKMenuRef.current) return
-            if (!topKMenuRef.current.contains(event.target as Node)) {
-                setShowTopKMenu(false)
-            }
-        }
-        document.addEventListener('mousedown', handler)
-        return () => document.removeEventListener('mousedown', handler)
-    }, [showTopKMenu])
-
-    useEffect(() => {
-        if (!selectedIndexedAreaId) return
-        if (!indexedAreas.some(area => area.id === selectedIndexedAreaId)) {
-            setSelectedIndexedAreaId(null)
-        }
-    }, [indexedAreas, selectedIndexedAreaId])
-
-    useEffect(() => {
-        const controller = new AbortController()
-        void loadIndexedAreas(controller.signal)
-        return () => controller.abort()
-    }, [])
-
-    useEffect(() => {
-        const controller = new AbortController()
-        void loadQueryExpansionConfig(controller.signal)
-        return () => controller.abort()
-    }, [])
-
-    useEffect(() => {
-        if (!queryExpansionAvailable) {
-            setQueryExpansionEnabled(false)
-        }
-    }, [queryExpansionAvailable])
-
-    useEffect(() => {
-        if (!queryExpansionEnabled) {
-            setExpandedQuery(null)
-        }
-    }, [queryExpansionEnabled])
+    const hybridBeta = clamp01(1 - hybridAlpha)
+    const hasMapCenter = Number.isFinite(mapCenter.latitude) && Number.isFinite(mapCenter.longitude)
 
     async function loadIndexedAreas(signal?: AbortSignal) {
         setIndexedAreasStatus('loading')
         setIndexedAreasError('')
         try {
             const res = await fetch(INDEXED_AREAS_API, {signal})
-            if (!res.ok) throw new Error(`Server responded with ${res.status}`)
+            if (!res.ok) {
+                setIndexedAreasError(`Server responded with ${res.status}`)
+                setIndexedAreasStatus('error')
+                return
+            }
             const data: unknown = await res.json()
             const parsed = parseIndexedAreasResponse(data)
             setIndexedAreas(prev => mergeActiveState(prev, parsed))
@@ -306,6 +333,91 @@ function App() {
         }
     }
 
+    useEffect(() => {
+        if (!showTopKMenu) return
+        const handler = (event: MouseEvent) => {
+            if (!topKMenuRef.current) return
+            if (!topKMenuRef.current.contains(event.target as Node)) {
+                setShowTopKMenu(false)
+            }
+        }
+        document.addEventListener('mousedown', handler)
+        return () => document.removeEventListener('mousedown', handler)
+    }, [showTopKMenu])
+
+    useEffect(() => {
+        if (!selectedIndexedAreaId) return
+        if (!indexedAreas.some(area => area.id === selectedIndexedAreaId)) {
+            // eslint-disable-next-line react-hooks/set-state-in-effect
+            setSelectedIndexedAreaId(null)
+        }
+    }, [indexedAreas, selectedIndexedAreaId])
+
+    useEffect(() => {
+        const controller = new AbortController()
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        void loadIndexedAreas(controller.signal)
+        return () => controller.abort()
+    }, [])
+
+    useEffect(() => {
+        const controller = new AbortController()
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        void loadQueryExpansionConfig(controller.signal)
+        return () => controller.abort()
+    }, [])
+
+    useEffect(() => {
+        if (!queryExpansionAvailable) {
+            // eslint-disable-next-line react-hooks/set-state-in-effect
+            setQueryExpansionEnabled(false)
+        }
+    }, [queryExpansionAvailable])
+
+    useEffect(() => {
+        if (!queryExpansionEnabled) {
+            // eslint-disable-next-line react-hooks/set-state-in-effect
+            setExpandedQuery(null)
+        }
+    }, [queryExpansionEnabled])
+
+    useEffect(() => {
+        if (!hybridRankingEnabled) {
+            // eslint-disable-next-line react-hooks/set-state-in-effect
+            setShowHybridControls(false)
+        }
+    }, [hybridRankingEnabled])
+
+    function buildSearchPayload(query: string, resolvedTopK: number) {
+        const useHybrid = hybridRankingEnabled
+        const payload: Record<string, unknown> = {
+            query,
+            top_k: resolvedTopK,
+            count: resolvedTopK,
+            hybrid: useHybrid,
+            ...(isQueryExpansionActive() ? {expand: true} : {}),
+        }
+
+        if (useHybrid) {
+            payload.alpha = hybridAlpha
+            payload.beta = hybridBeta
+            payload.decay_radius_km = hybridDecayRadiusKm
+            if (hybridCategory.trim()) {
+                payload.category = hybridCategory.trim()
+            }
+            if (hasMapCenter) {
+                payload.center_lat = mapCenter.latitude
+                payload.center_lng = mapCenter.longitude
+            }
+        }
+
+        return payload
+    }
+
+    function isQueryExpansionActive() {
+        return queryExpansionAvailable && queryExpansionEnabled
+    }
+
     async function handleSearchSubmit(e: FormEvent) {
         e.preventDefault()
         const query = searchQuery.trim()
@@ -322,18 +434,18 @@ function App() {
         setExpandedQuery(null)
         try {
             const resolvedTopK = resolveTopK(topK)
-            const useQueryExpansion = queryExpansionAvailable && queryExpansionEnabled
+            const useQueryExpansion = isQueryExpansionActive()
             console.log(`Searching for "${query}" with topK=${resolvedTopK}...`)
             const res = await fetch(`${SEARCH_API}/search`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    query,
-                    count: resolvedTopK,
-                    ...(useQueryExpansion ? {expand: true} : {}),
-                }),
+                body: JSON.stringify(buildSearchPayload(query, resolvedTopK)),
             })
-            if (!res.ok) throw new Error(`Server responded with ${res.status}`)
+            if (!res.ok) {
+                setSearchError(`Server responded with ${res.status}`)
+                setSearchStatus('error')
+                return
+            }
             const data: unknown = await res.json()
             const {rows, expandedQuery: responseExpandedQuery} = parseSearchResultsResponse(data)
             const parsed = rows.map((row, index) => normalizeSearchResult(row as Record<string, unknown>, index))
@@ -428,6 +540,9 @@ function App() {
                         focusedFeature={focusedFeature}
                         focusedBBox={selectedIndexedArea?.bbox ?? null}
                         baseMap={showSatellite ? 'satellite' : 'osm'}
+                        onViewStateChange={viewState => {
+                            setMapCenter({latitude: viewState.latitude, longitude: viewState.longitude})
+                        }}
                     />
 
                     <div className="absolute top-4 right-4 z-40">
@@ -552,6 +667,94 @@ function App() {
                                         </span>
                                     </label>
                                 )}
+
+                                <div className={`rounded-xl border px-3 py-3 transition-colors ${
+                                    hybridRankingEnabled ? 'border-slate-200 bg-white' : 'border-slate-100 bg-slate-50'
+                                }`}>
+                                    <div className="flex items-center justify-between gap-3">
+                                        <label className="flex items-center gap-2 text-xs font-medium text-slate-700">
+                                            <span>Hybrid Ranking</span>
+                                            <input
+                                                type="checkbox"
+                                                checked={hybridRankingEnabled}
+                                                onChange={e => setHybridRankingEnabled(e.target.checked)}
+                                                className="accent-slate-700"
+                                            />
+                                        </label>
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowHybridControls(v => !v)}
+                                            className="text-[10px] font-medium uppercase tracking-[0.14em] text-slate-400 transition-colors hover:text-slate-600"
+                                        >
+                                            {showHybridControls ? 'Hide controls' : 'Show controls'}
+                                        </button>
+                                    </div>
+
+                                    {showHybridControls && (
+                                        <div className={`mt-3 space-y-3 ${hybridRankingEnabled ? '' : 'opacity-60'}`}>
+                                            <HybridSlider
+                                                label="Alpha (semantic weight)"
+                                                value={hybridAlpha}
+                                                onChange={value => setHybridAlpha(value)}
+                                                min={0}
+                                                max={1}
+                                                step={0.01}
+                                                disabled={!hybridRankingEnabled}
+                                                valueLabel={formatScore(hybridAlpha)}
+                                            />
+                                            <HybridSlider
+                                                label="Beta (geo weight)"
+                                                value={hybridBeta}
+                                                onChange={value => setHybridAlpha(1 - value)}
+                                                min={0}
+                                                max={1}
+                                                step={0.01}
+                                                disabled={!hybridRankingEnabled}
+                                                valueLabel={formatScore(hybridBeta)}
+                                            />
+                                            <HybridSlider
+                                                label="Decay radius (km)"
+                                                value={hybridDecayRadiusKm}
+                                                onChange={value => setHybridDecayRadiusKm(value)}
+                                                min={1}
+                                                max={50}
+                                                step={1}
+                                                disabled={!hybridRankingEnabled}
+                                                valueLabel={`${Math.round(hybridDecayRadiusKm)} km`}
+                                            />
+                                            <label className="block rounded-lg border border-slate-100 bg-slate-50 px-3 py-2">
+                                                <div className="flex items-center justify-between gap-3 text-[11px] text-slate-500">
+                                                    <span className="font-medium text-slate-700">Category bonus</span>
+                                                    <span className="font-mono text-slate-400">optional</span>
+                                                </div>
+                                                <input
+                                                    type="text"
+                                                    value={hybridCategory}
+                                                    onChange={e => setHybridCategory(e.target.value)}
+                                                    placeholder="e.g. park"
+                                                    disabled={!hybridRankingEnabled}
+                                                    className="mt-2 w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none transition-colors focus:border-slate-400 disabled:cursor-not-allowed disabled:bg-slate-100"
+                                                />
+                                            </label>
+                                            <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2 text-[11px] text-slate-500">
+                                                <span>Map center</span>
+                                                <span className="font-mono text-slate-600">
+                                                    {mapCenter.latitude.toFixed(4)}, {mapCenter.longitude.toFixed(4)}
+                                                </span>
+                                            </div>
+                                            <div className="flex items-center justify-between gap-3 text-[11px] text-slate-500">
+                                                <span>
+                                                    {hybridRankingEnabled
+                                                        ? 'Hybrid parameters will be sent with the next search.'
+                                                        : 'Vector-only mode keeps the original Lynx order.'}
+                                                </span>
+                                                <span className="font-medium text-slate-600">
+                                                    α {hybridAlpha.toFixed(2)} · β {hybridBeta.toFixed(2)}
+                                                </span>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
 
                                 {searchStatus === 'success' && expandedQuery && (
                                     <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/80 px-3 py-2">
@@ -800,24 +1003,41 @@ function SearchResultRow({
     onSelect: () => void
 }) {
     const confidence = formatConfidence(result.confidence)
+    const finalScore = resolveFinalScore(result)
+    const semanticScore = result.semantic_score
+    const geoScore = result.geo_score
+    const tone = scoreTone(finalScore ?? semanticScore)
     return (
         <li>
             <button
                 type="button"
                 onClick={onSelect}
-                className={`w-full text-left border rounded-md px-3 py-2.5 transition-colors ${
+                className={`group w-full text-left border rounded-md px-3 py-2.5 transition-colors ${
                     selected ? 'border-teal-400 bg-teal-50/70' : 'border-gray-200 bg-white hover:border-gray-300'
                 }`}
             >
                 <div className="flex items-start justify-between gap-2">
-                    <span className="text-sm text-gray-800 leading-snug truncate">
-                        {result.embed_text || result.id}
-                    </span>
-                    {confidence && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 font-medium tabular-nums">
-                            {confidence}
+                    <div className="min-w-0 flex-1">
+                        <span className="block truncate text-sm text-gray-800 leading-snug">
+                            {result.embed_text || result.id}
                         </span>
-                    )}
+                        <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-gray-100">
+                            <div
+                                className={`h-full ${tone.fill} transition-all`}
+                                style={{width: `${finalScore * 100}%`}}
+                            />
+                        </div>
+                    </div>
+                    <div className="flex shrink-0 flex-col items-end gap-1">
+                        <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold tabular-nums border ${tone.badge}`}>
+                            {formatScore(finalScore)}
+                        </span>
+                        {confidence && (
+                            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-gray-500">
+                                {confidence}
+                            </span>
+                        )}
+                    </div>
                 </div>
                 {(result.category || result.country) && (
                     <div className="mt-1 flex flex-wrap gap-2 text-[10px] text-gray-400">
@@ -825,6 +1045,13 @@ function SearchResultRow({
                         {result.country && <span>{result.country}</span>}
                     </div>
                 )}
+                <div className="mt-2 overflow-hidden text-[10px] text-gray-400">
+                    <div className="grid grid-cols-3 gap-2 opacity-0 transition-all duration-150 group-hover:opacity-100 group-focus-within:opacity-100">
+                        <span className="rounded bg-gray-50 px-1.5 py-1 tabular-nums">Final {formatScore(finalScore)}</span>
+                        <span className="rounded bg-gray-50 px-1.5 py-1 tabular-nums">Semantic {formatScore(semanticScore)}</span>
+                        <span className="rounded bg-gray-50 px-1.5 py-1 tabular-nums">Geo {formatScore(geoScore)}</span>
+                    </div>
+                </div>
                 <p className="mt-1 text-[10px] text-gray-300 font-mono truncate">{result.id}</p>
             </button>
         </li>
@@ -852,6 +1079,9 @@ function SelectedResultPanel({result}: { result: SearchResult | null }) {
         ['category', result.category],
         ['country', result.country],
         ['confidence', formatConfidence(result.confidence)],
+        ['final_score', formatScore(result.final_score)],
+        ['semantic_score', formatScore(result.semantic_score)],
+        ['geo_score', formatScore(result.geo_score)],
         ['geometry', result.geom],
     ]
     if (result.raw && typeof result.raw === 'object') {
@@ -869,7 +1099,7 @@ function SelectedResultPanel({result}: { result: SearchResult | null }) {
                 {entries.map(([key, value]) => (
                     <div key={key} className="text-[11px] text-gray-500">
                         <p className="uppercase tracking-wide text-[9px] text-gray-400">{key}</p>
-                        <pre className="whitespace-pre-wrap break-words text-gray-700">{formatDetailValue(value)}</pre>
+                        <pre className="whitespace-pre-wrap wrap-break-word text-gray-700">{formatDetailValue(value)}</pre>
                     </div>
                 ))}
             </div>
@@ -1084,6 +1314,45 @@ function IndexedAreasPanel({
                 </div>
             )}
         </div>
+    )
+}
+
+function HybridSlider({
+    label,
+    value,
+    onChange,
+    min,
+    max,
+    step,
+    disabled,
+    valueLabel,
+}: {
+    label: string
+    value: number
+    onChange: (value: number) => void
+    min: number
+    max: number
+    step: number
+    disabled: boolean
+    valueLabel: string
+}) {
+    return (
+        <label className={`block rounded-lg border px-3 py-2 ${disabled ? 'border-slate-100 bg-slate-50' : 'border-slate-100 bg-white'}`}>
+            <div className="flex items-center justify-between gap-3 text-[11px] text-slate-500">
+                <span className="font-medium text-slate-700">{label}</span>
+                <span className="font-mono text-slate-600">{valueLabel}</span>
+            </div>
+            <input
+                type="range"
+                min={min}
+                max={max}
+                step={step}
+                value={value}
+                onChange={e => onChange(Number(e.target.value))}
+                disabled={disabled}
+                className="mt-2 w-full accent-slate-700"
+            />
+        </label>
     )
 }
 
