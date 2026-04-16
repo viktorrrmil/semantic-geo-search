@@ -16,6 +16,9 @@ This project is intentionally split: the backend focuses on workflow and data ac
 - Run semantic searches across indexed areas.
 - Visualize indexed coverage and search results on the map.
 
+![main_map_screenshot.png](main_map_screenshot.png)
+![customization_screenshot.png](customization_screenshot.png)
+
 ## Architecture
 This design enables semantic retrieval systems to be extended with geospatial and UI-driven constraints without modifying the underlying search engine.
 ```
