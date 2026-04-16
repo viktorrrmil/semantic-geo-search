@@ -1,4 +1,4 @@
-import {useEffect, useRef, useState, type FormEvent} from 'react'
+import {useCallback, useEffect, useRef, useState, type FormEvent} from 'react'
 import MapView, {type BBox, type IndexedArea} from './components/MapView'
 import S3Explorer, {type FileItem, type SelectedFile} from './components/S3Explorer'
 import type {GeoJSONGeometry, Geometry, SpatialFeature} from './components/DataPanel'
@@ -270,6 +270,7 @@ function App() {
     const [expandedQuery, setExpandedQuery] = useState<string | null>(null)
     const [topK, setTopK] = useState(String(DEFAULT_TOP_K))
     const [showTopKMenu, setShowTopKMenu] = useState(false)
+    const [showSearchOptions, setShowSearchOptions] = useState(false)
     const [mapCenter, setMapCenter] = useState(INITIAL_MAP_CENTER)
     const [hybridRankingEnabled, setHybridRankingEnabled] = useState(true)
     const [showHybridControls, setShowHybridControls] = useState(true)
@@ -284,6 +285,9 @@ function App() {
     const [focusedFeature, setFocusedFeature] = useState<SpatialFeature | null>(null)
     const [showIndexedOverlay, setShowIndexedOverlay] = useState(false)
     const [showSatellite, setShowSatellite] = useState(false)
+
+    const mapCenterRafRef = useRef<number | null>(null)
+    const pendingMapCenterRef = useRef(INITIAL_MAP_CENTER)
 
     const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null)
     const [selectionBBox, setSelectionBBox] = useState<BBox | null>(null)
@@ -300,6 +304,40 @@ function App() {
         : null
     const hybridBeta = clamp01(1 - hybridAlpha)
     const hasMapCenter = Number.isFinite(mapCenter.latitude) && Number.isFinite(mapCenter.longitude)
+
+    const handleMapViewStateChange = useCallback((viewState: { latitude: number; longitude: number }) => {
+        pendingMapCenterRef.current = {latitude: viewState.latitude, longitude: viewState.longitude}
+        if (mapCenterRafRef.current != null) return
+        mapCenterRafRef.current = requestAnimationFrame(() => {
+            mapCenterRafRef.current = null
+            const next = pendingMapCenterRef.current
+            setMapCenter(prev => {
+                if (Math.abs(prev.latitude - next.latitude) < 1e-6 && Math.abs(prev.longitude - next.longitude) < 1e-6) {
+                    return prev
+                }
+                return next
+            })
+        })
+    }, [])
+
+    const handleMapFeatureSelect = useCallback((feature: SpatialFeature) => {
+        // Reuse the same focused-feature path as selecting from the results list.
+        setFocusedFeature(feature)
+
+        const rawId = feature.properties.id
+        const clickedId = typeof rawId === 'string'
+            ? rawId
+            : (rawId != null ? String(rawId) : '')
+        if (clickedId) {
+            setSelectedResultId(clickedId)
+            return
+        }
+
+        const indexByRef = searchFeatures.findIndex(item => item === feature)
+        if (indexByRef >= 0 && searchResults[indexByRef]) {
+            setSelectedResultId(searchResults[indexByRef].id)
+        }
+    }, [searchFeatures, searchResults])
 
     async function loadIndexedAreas(signal?: AbortSignal) {
         setIndexedAreasStatus('loading')
@@ -346,6 +384,13 @@ function App() {
     }, [showTopKMenu])
 
     useEffect(() => {
+        if (!showSearchOptions && showTopKMenu) {
+            // Keep popovers closed when the compact mode hides option controls.
+            setShowTopKMenu(false)
+        }
+    }, [showSearchOptions, showTopKMenu])
+
+    useEffect(() => {
         if (!selectedIndexedAreaId) return
         if (!indexedAreas.some(area => area.id === selectedIndexedAreaId)) {
             // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -387,6 +432,14 @@ function App() {
             setShowHybridControls(false)
         }
     }, [hybridRankingEnabled])
+
+    useEffect(() => {
+        return () => {
+            if (mapCenterRafRef.current != null) {
+                cancelAnimationFrame(mapCenterRafRef.current)
+            }
+        }
+    }, [])
 
     function buildSearchPayload(query: string, resolvedTopK: number) {
         const useHybrid = hybridRankingEnabled
@@ -540,24 +593,23 @@ function App() {
                         focusedFeature={focusedFeature}
                         focusedBBox={selectedIndexedArea?.bbox ?? null}
                         baseMap={showSatellite ? 'satellite' : 'osm'}
-                        onViewStateChange={viewState => {
-                            setMapCenter({latitude: viewState.latitude, longitude: viewState.longitude})
-                        }}
+                        onFeatureSelect={handleMapFeatureSelect}
+                        onViewStateChange={handleMapViewStateChange}
                     />
 
-                    <div className="absolute top-4 right-4 z-40">
+                    <div className="pointer-events-none absolute top-4 right-4 z-40">
                         <button
                             onClick={() => setPage('index')}
-                            className="text-[11px] text-gray-500 bg-white/90 border border-gray-200 rounded-md px-3 py-1.5 shadow-sm hover:border-gray-300 hover:text-gray-700 transition-colors"
+                            className="pointer-events-auto text-[11px] text-gray-500 bg-white/90 border border-gray-200 rounded-md px-3 py-1.5 shadow-sm hover:border-gray-300 hover:text-gray-700 transition-colors"
                         >
                             Open indexing dashboard
                         </button>
                     </div>
 
-                    <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 w-[min(860px,90vw)]">
-                        <div className="rounded-2xl border border-gray-200/80 bg-white/95 px-3 py-3 shadow-xl backdrop-blur-sm">
-                            <form onSubmit={handleSearchSubmit} className="flex flex-col gap-2.5 xl:flex-row xl:items-center">
-                                <div className="flex flex-1 items-center gap-2 rounded-xl border border-gray-200 bg-gray-50/80 px-3 py-2.5 shadow-sm transition-colors focus-within:border-gray-300 focus-within:bg-white">
+                    <div className="pointer-events-none absolute top-3 left-1/2 -translate-x-1/2 z-40 w-[min(760px,92vw)]">
+                        <div className="pointer-events-auto rounded-2xl border border-gray-200/80 bg-white/95 px-2.5 py-2.5 shadow-xl backdrop-blur-sm">
+                            <form onSubmit={handleSearchSubmit} className="flex flex-col gap-2 xl:flex-row xl:items-center">
+                                <div className="flex flex-1 items-center gap-2 rounded-xl border border-gray-200 bg-gray-50/80 px-3 py-2 shadow-sm transition-colors focus-within:border-gray-300 focus-within:bg-white">
                                     <svg className="h-4 w-4 shrink-0 text-gray-400" viewBox="0 0 20 20" fill="none" aria-hidden="true">
                                         <circle cx="8.5" cy="8.5" r="5.75" stroke="currentColor" strokeWidth="1.5" />
                                         <path d="M12.5 12.5L16 16" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
@@ -581,12 +633,12 @@ function App() {
                                     )}
                                 </div>
 
-                                <div className="flex items-center gap-2 self-stretch xl:self-auto">
+                                <div className="flex items-center gap-1.5 self-stretch xl:self-auto">
                                     <div className="relative" ref={topKMenuRef}>
                                         <button
                                             type="button"
                                             onClick={() => setShowTopKMenu(v => !v)}
-                                            className="inline-flex h-10 min-w-24 items-center justify-between gap-2 rounded-xl border border-gray-200 bg-white px-3 text-sm font-medium text-gray-700 shadow-sm transition-colors hover:border-gray-300 hover:bg-gray-50"
+                                            className="inline-flex h-9 min-w-20 items-center justify-between gap-2 rounded-xl border border-gray-200 bg-white px-2.5 text-sm font-medium text-gray-700 shadow-sm transition-colors hover:border-gray-300 hover:bg-gray-50"
                                             aria-label="Set result count"
                                             aria-expanded={showTopKMenu}
                                         >
@@ -635,42 +687,57 @@ function App() {
                                     </div>
 
                                     <button
+                                        type="button"
+                                        onClick={() => setShowSearchOptions(v => !v)}
+                                        className="inline-flex h-9 items-center gap-1.5 rounded-xl border border-gray-200 bg-white px-2.5 text-[11px] font-medium uppercase tracking-[0.12em] text-gray-600 shadow-sm transition-colors hover:border-gray-300 hover:bg-gray-50"
+                                        aria-expanded={showSearchOptions}
+                                        aria-label="Toggle search options"
+                                    >
+                                        Options
+                                        <span className={`text-gray-400 transition-transform ${showSearchOptions ? 'rotate-180' : ''}`}>▾</span>
+                                    </button>
+
+                                    <button
                                         type="submit"
                                         disabled={!searchQuery.trim() || searchStatus === 'loading'}
-                                        className="inline-flex h-10 items-center justify-center rounded-xl bg-gray-900 px-4 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-40"
+                                        className="inline-flex h-9 items-center justify-center rounded-xl bg-gray-900 px-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-40"
                                     >
                                         {searchStatus === 'loading' ? 'Searching…' : 'Search'}
                                     </button>
                                 </div>
                             </form>
 
-                            <div className="mt-2 flex flex-col gap-2">
-                                {queryExpansionAvailable && (
-                                    <label
-                                        className={`flex cursor-pointer items-center justify-between gap-3 rounded-xl border px-3 py-1.5 transition-colors ${
-                                            queryExpansionEnabled
-                                                ? 'border-slate-300 bg-slate-50'
-                                                : 'border-slate-200 bg-white hover:border-slate-300'
-                                        }`}
-                                    >
-                                        <span className="min-w-0 flex-1 text-xs font-medium text-slate-700">Expand search</span>
-                                        <span className="relative h-5 w-9 shrink-0">
-                                            <input
-                                                type="checkbox"
-                                                checked={queryExpansionEnabled}
-                                                onChange={e => setQueryExpansionEnabled(e.target.checked)}
-                                                className="peer sr-only"
-                                                aria-label="Enable query expansion"
-                                            />
-                                            <span className="absolute inset-0 rounded-full border border-slate-300 bg-white shadow-sm transition-colors duration-200 peer-checked:border-slate-700 peer-checked:bg-slate-700" />
-                                            <span className="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
-                                        </span>
-                                    </label>
-                                )}
+                            <div
+                                className={`grid transition-all duration-200 ${showSearchOptions ? 'mt-2 grid-rows-[1fr] opacity-100' : 'mt-0 grid-rows-[0fr] opacity-0'}`}
+                            >
+                                <div className="overflow-hidden">
+                                    <div className="flex flex-col gap-2 border-t border-gray-100 pt-2">
+                                        {queryExpansionAvailable && (
+                                            <label
+                                                className={`flex cursor-pointer items-center justify-between gap-3 rounded-xl border px-3 py-1.5 transition-colors ${
+                                                    queryExpansionEnabled
+                                                        ? 'border-slate-300 bg-slate-50'
+                                                        : 'border-slate-200 bg-white hover:border-slate-300'
+                                                }`}
+                                            >
+                                                <span className="min-w-0 flex-1 text-xs font-medium text-slate-700">Expand search</span>
+                                                <span className="relative h-5 w-9 shrink-0">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={queryExpansionEnabled}
+                                                        onChange={e => setQueryExpansionEnabled(e.target.checked)}
+                                                        className="peer sr-only"
+                                                        aria-label="Enable query expansion"
+                                                    />
+                                                    <span className="absolute inset-0 rounded-full border border-slate-300 bg-white shadow-sm transition-colors duration-200 peer-checked:border-slate-700 peer-checked:bg-slate-700" />
+                                                    <span className="absolute left-0.5 top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-200 peer-checked:translate-x-4" />
+                                                </span>
+                                            </label>
+                                        )}
 
-                                <div className={`rounded-xl border px-3 py-3 transition-colors ${
-                                    hybridRankingEnabled ? 'border-slate-200 bg-white' : 'border-slate-100 bg-slate-50'
-                                }`}>
+                                        <div className={`rounded-xl border px-3 py-3 transition-colors ${
+                                            hybridRankingEnabled ? 'border-slate-200 bg-white' : 'border-slate-100 bg-slate-50'
+                                        }`}>
                                     <div className="flex items-center justify-between gap-3">
                                         <label className="flex items-center gap-2 text-xs font-medium text-slate-700">
                                             <span>Hybrid Ranking</span>
@@ -755,25 +822,27 @@ function App() {
                                         </div>
                                     )}
                                 </div>
-
-                                {searchStatus === 'success' && expandedQuery && (
-                                    <div className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/80 px-3 py-2">
-                                        <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">
-                                            Expanded
-                                        </span>
-                                        <p className="min-w-0 flex-1 truncate text-[11px] leading-relaxed text-slate-700">
-                                            “{expandedQuery}”
-                                        </p>
                                     </div>
-                                )}
+                                </div>
                             </div>
+
+                            {searchStatus === 'success' && expandedQuery && (
+                                <div className="mt-2 flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50/80 px-3 py-2">
+                                    <span className="rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-500">
+                                        Expanded
+                                    </span>
+                                    <p className="min-w-0 flex-1 truncate text-[11px] leading-relaxed text-slate-700">
+                                        “{expandedQuery}”
+                                    </p>
+                                </div>
+                            )}
                         </div>
                         {searchError && (
-                            <p className="mt-2 text-center text-[11px] text-rose-500">{searchError}</p>
+                            <p className="pointer-events-auto mt-2 text-center text-[11px] text-rose-500">{searchError}</p>
                         )}
                     </div>
-                        <div className="absolute top-4 left-4 z-30 w-80 max-w-[85vw] flex flex-col gap-3">
-                            <div className="bg-white/90 border border-gray-200 rounded-lg shadow-sm flex flex-col overflow-hidden max-h-[55vh] min-h-55">
+                        <div className="pointer-events-none absolute top-4 left-4 z-30 w-80 max-w-[85vw] flex flex-col gap-3">
+                            <div className="pointer-events-auto bg-white/90 border border-gray-200 rounded-lg shadow-sm flex flex-col overflow-hidden max-h-[55vh] min-h-55">
                             <div className="px-4 py-3 border-b border-gray-100">
                                 <div className="flex items-start justify-between gap-3">
                                     <div>
@@ -787,7 +856,7 @@ function App() {
                                     )}
                                 </div>
                                 {searchStatus === 'success' && expandedQuery && (
-                                    <p className="mt-2 max-h-14 overflow-hidden rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2 text-[11px] leading-relaxed text-slate-700">
+                                    <p className="mt-2 max-h-17 overflow-hidden rounded-xl border border-slate-200 bg-slate-50/70 px-3 py-2 text-[11px] leading-relaxed text-slate-700">
                                         “{expandedQuery}”
                                     </p>
                                 )}
@@ -854,7 +923,7 @@ function App() {
                             onDelete={id => {
                                 setIndexedAreas(prev => prev.filter(area => area.id !== id))
                             }}
-                            className="w-full max-h-[30vh]"
+                            className="pointer-events-auto w-full max-h-[30vh]"
                             overlayEnabled={showIndexedOverlay}
                             onOverlayToggle={() => setShowIndexedOverlay(v => !v)}
                             satelliteEnabled={showSatellite}
@@ -1090,7 +1159,7 @@ function SelectedResultPanel({result}: { result: SearchResult | null }) {
         }
     }
     return (
-        <div className="absolute top-20 right-4 z-30 w-80 max-w-[85vw] bg-white/95 border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+        <div className="pointer-events-auto absolute top-20 right-4 z-30 w-80 max-w-[85vw] bg-white/95 border border-gray-200 rounded-lg shadow-sm overflow-hidden">
             <div className="px-4 py-3 border-b border-gray-100">
                 <p className="text-[11px] text-gray-400">Selected result</p>
                 <p className="text-sm text-gray-700 mt-1 leading-snug">{result.embed_text || result.id}</p>
@@ -1120,7 +1189,7 @@ function IndexedAreaPopup({
     const total = typeof area.totalPoints === 'number' ? area.totalPoints : null
     const indexed = typeof area.indexedPoints === 'number' ? area.indexedPoints : null
     return (
-        <div className="absolute bottom-6 right-4 z-30 w-80 max-w-[85vw] bg-white/95 border border-gray-200 rounded-lg shadow-lg overflow-hidden">
+        <div className="pointer-events-auto absolute bottom-6 right-4 z-30 w-80 max-w-[85vw] bg-white/95 border border-gray-200 rounded-lg shadow-lg overflow-hidden">
             <div className="px-4 py-3 border-b border-gray-100 flex items-start justify-between gap-2">
                 <div className="min-w-0">
                     <p className="text-[11px] text-gray-400">Indexed area</p>

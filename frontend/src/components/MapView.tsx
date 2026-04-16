@@ -43,6 +43,7 @@ interface Props {
     focusedFeature?: SpatialFeature | null
     focusedBBox?: BBox | null
     baseMap?: 'osm' | 'satellite'
+    onFeatureSelect?: (feature: SpatialFeature) => void
 }
 
 const INITIAL_VIEW_STATE: MapViewState = {
@@ -364,13 +365,6 @@ function resolveFinalScore(feature: SpatialFeature): number {
         : 0
 }
 
-function scoreColor(score: number): [number, number, number, number] {
-    const alpha = 110 + Math.round(score * 140)
-    if (score > 0.8) return [34, 197, 94, alpha]
-    if (score >= 0.5) return [234, 179, 8, alpha]
-    return [148, 163, 184, alpha]
-}
-
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function MapView({
@@ -384,6 +378,7 @@ export default function MapView({
                                      focusedFeature = null,
                                      focusedBBox = null,
                                      baseMap = 'osm',
+                                     onFeatureSelect,
                                  }: Props) {
     const containerRef = useRef<HTMLDivElement>(null)
     const [viewState, setViewState] = useState<MapViewState>(INITIAL_VIEW_STATE)
@@ -495,11 +490,13 @@ export default function MapView({
             id: 'points',
             data: points,
             getPosition: d => d.pos,
-            getRadius: d => 5 + resolveFinalScore(d.feature) * 11,
+            getRadius: d => 4 + resolveFinalScore(d.feature) * 4,
             radiusUnits: 'pixels',
-            getFillColor: d => scoreColor(resolveFinalScore(d.feature)),
-            getLineColor: [255, 255, 255, 180],
-            lineWidthMinPixels: 1.5,
+            radiusMinPixels: 5,
+            radiusMaxPixels: 10,
+            getFillColor: [29, 78, 216, 240],
+            getLineColor: [255, 255, 255, 255],
+            lineWidthMinPixels: 2,
             stroked: true,
             pickable: true,
         })
@@ -680,12 +677,20 @@ export default function MapView({
                     dragPan: !isDrawing,
                     dragRotate: false,
                     touchRotate: false,
+                    keyboard: true,
                     scrollZoom: true,
                     doubleClickZoom: true,
+                    touchZoom: true,
                 }}
                 layers={layers}
                 style={{width: '100%', height: '100%'}}
                 getTooltip={getTooltip}
+                onClick={info => {
+                    const object = info.object as { feature?: SpatialFeature } | null
+                    if (object?.feature) {
+                        onFeatureSelect?.(object.feature)
+                    }
+                }}
                 onDragStart={(info, event) => {
                     if (!onSelectionChange) return
                     if (!containerRef.current) return
