@@ -1,86 +1,121 @@
-# semantic-geo-search
+# Semantic Geo Search
 
-Semantic Geo Search is the geo-facing part of Lynx. It gives you a map-based way to browse spatial data, draw bounding boxes, and launch indexing or search jobs against the Lynx backend.
+Semantic Geo Search is an application layer that turns a vector-search backend into a usable geospatial search product.
 
-Together, this repo and Lynx form one system:
+It provides a map-driven interface and a lightweight Go orchestration layer for dataset browsing, indexing workflows, and search execution over geographic data.
 
-- `backend/` — the Go application layer that proxies requests into Lynx, lists public S3 folders, and previews Parquet data with DuckDB.
-- `frontend/` — the React + TypeScript + Vite interface for searching, selecting areas, and starting indexing.
+The underlying vector search and indexing engine runs in a separate service ([Lynx](https://github.com/viktorrrmil/lynx)). This repository focuses on workflow, geospatial interaction, and retrieval orchestration.
 
-Lynx provides the search and indexing engine itself. This repository focuses on the user-facing workflow and the supporting API around it.
+This project is intentionally split: the backend focuses on workflow and data access, while the external search service focuses on embeddings, indexing, and retrieval. The result is a production-minded system for geo discovery without bundling a full search engine into the UI layer.
 
-## What this project does
+## What the system does
 
-- Browse spatial datasets from public S3 locations.
-- Preview Parquet files locally or from S3.
-- Draw a bounding box on the map and start indexing for a file or folder.
-- Search indexed areas from the map UI.
-- Show indexed area coverage and search results on an interactive map.
+- Browse public spatial datasets in S3.
+- Preview Parquet files locally or over S3.
+- Draw bounding boxes on a map to scope indexing.
+- Run semantic searches across indexed areas.
+- Visualize indexed coverage and search results on the map.
 
-## Project layout
+## Architecture
+This design enables semantic retrieval systems to be extended with geospatial and UI-driven constraints without modifying the underlying search engine.
+```
+Browser (React + deck.gl)
+  -> Go API (gin)
+      -> External vector-search backend
+      -> Public S3 (anonymous listing)
+      -> DuckDB (Parquet preview)
+```
+
+### Why this architecture
+- **Thin API layer:** validates inputs and keeps the UI decoupled from the upstream search engine.
+- **Hybrid ranking:** application-level ranking layer that combines semantic similarity with geospatial distance and optional category bias, without modifying the underlying search engine.
+- **DuckDB preview:** fast Parquet sampling without standing up a data warehouse.
+- **Anonymous S3 browsing:** no credentials needed for public buckets.
+
+## Repository layout
 
 ```text
 semantic-geo-search/
-├── backend/          Go API server and helper services
-├── frontend/         React UI
-├── explanation.md    Longer architecture and implementation notes
-├── README.md         This file
+├── backend/          Go API server and services
+├── frontend/         React + Vite UI
+├── explanation.md    Deep dive on architecture and flows
+└── README.md         This file
 ```
 
 Sample data lives under `backend/`:
+`places_dubai.json`, `places_dubai.parquet`, and `chunks/`.
 
-- `places_dubai.json`
-- `places_dubai.parquet`
-- `chunks/`
+## Backend overview (Go)
 
-## Prerequisites
+**Runtime:** Go 1.25+  
+**Framework:** Gin  
+**Config:** `.env` (optional)
 
-You will need:
+### Key routes
 
-- Go 1.25 or newer
-- Node.js 20 or newer
-- npm
-- Access to the external vector-search backend the app talks to
+| Route | Method | Purpose |
+| --- | --- | --- |
+| `/search` | POST | Proxy search with optional hybrid reranking |
+| `/api/v1/query-expansion` | GET | Reports query expansion availability |
+| `/api/v1/list-files/*url` | GET | List public S3 bucket/prefix |
+| `/api/v1/spatial-data` | GET | Preview Parquet rows via DuckDB |
+| `/api/v1/index-file` | POST | Forward indexing request (async) |
+| `/api/v1/geo/indexed-areas` | GET | Proxy indexed area metadata |
+
+### Notable backend decisions
+- **Strict validation:** bbox sanity checks, row limits, and region sanitization.
+- **Hybrid reranking:** optional scoring layer that blends semantic distance with geo distance.
+- **Query expansion:** optional Gemini-based query enrichment gated by `GEMINI_API_KEY`.
+- **DuckDB singleton:** preloads `httpfs` and `spatial` extensions and normalizes types to JSON.
+
+## Frontend overview (React)
+
+**Stack:** React 19, Vite, Tailwind CSS, deck.gl
+
+### Main flows
+1. **Map search:** query indexed areas, visualize results, and inspect scores.
+2. **Indexing dashboard:** select S3 files, draw a bbox, and submit async indexing.
+
+### Notable frontend decisions
+- Supports **WKT and GeoJSON** for geometry rendering.
+- Uses deck.gl layers for **points, lines, and polygons** with interactive selection.
+- Map center is fed into search requests to drive geo-aware reranking.
 
 ## Configuration
 
+### Backend env vars
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `PORT` | API port | `3001` |
+| `MAIN_BACKEND_URL` | External search backend | `http://localhost:8080` |
+| `GEMINI_API_KEY` | Enables query expansion | unset |
+
+### Frontend endpoints
+
+The UI currently uses hardcoded localhost URLs:
+- `http://localhost:3001` for search
+- `http://localhost:3001/api/v1/...` for API endpoints
+
+To point at a different host, update the constants in `frontend/src/App.tsx`.
+
+## Running locally
+
 ### Backend
-
-The Go server reads these environment variables:
-
-- `PORT` — HTTP port for the Go API, default `3001`
-- `MAIN_BACKEND_URL` — URL of the external vector-search backend, default `http://localhost:8080`
-
-### Frontend
-
-The frontend currently uses hardcoded local endpoints:
-
-- `http://localhost:3001` for the Go API
-- `http://localhost:3001/api/v1/...` for data and indexing endpoints
-
-If you want to point the UI at a different backend host, update the constants in `frontend/src/App.tsx`.
-
-## Run the backend
-
-From the repository root:
 
 ```bash
 cd backend
 go run .
 ```
 
-By default the server starts on port `3001`.
-
-If you need to change the port or upstream backend URL:
+With custom settings:
 
 ```bash
 cd backend
 PORT=3001 MAIN_BACKEND_URL=http://localhost:8080 go run .
 ```
 
-## Run the frontend
-
-In a second terminal:
+### Frontend
 
 ```bash
 cd frontend
@@ -88,43 +123,22 @@ npm install
 npm run dev
 ```
 
-The Vite dev server will print the local URL it is serving on.
-
 ## Typical workflow
 
-1. Start the Go backend.
-2. Start the frontend.
-3. Open the app in the browser.
-4. Use the main map view to search indexed areas.
-5. Open the indexing dashboard to:
-   - select a file or folder from S3,
-   - draw a bounding box on the map,
-   - enter an optional row limit,
-   - click **Index selection**.
+1. Start the backend and frontend.
+2. Search indexed areas from the main map view.
+3. Open the indexing dashboard to:
+   - select a file or folder in S3,
+   - draw a bounding box,
+   - optionally set a row limit,
+   - start indexing.
 
-## API summary
-
-The Go backend exposes these main routes:
-
-- `POST /search` — semantic search request proxy
-- `GET /api/v1/geo/indexed-areas` — list indexed areas
-- `GET /api/v1/list-files/*url` — list public S3 folders
-- `GET /api/v1/spatial-data` — preview Parquet rows
-- `POST /api/v1/index-file` — start indexing for a file and bbox
-
-## Frontend notes
-
-- The main app lives in `frontend/src/App.tsx`.
-- The map is built with deck.gl.
-- The indexing dashboard lets you submit multiple index requests back to back.
-- The `frontend/README.md` is still the default Vite template and is not specific to this project.
-
-## Caveats
+## Caveats and known edges
 
 - The external vector-search backend must be running separately.
-- The frontend currently uses localhost URLs directly instead of environment variables.
-- `SearchView.tsx` references endpoints that are not implemented in this repo, so it appears to be an older or alternate flow.
+- Frontend endpoints are hardcoded to localhost.
+- `SearchView.tsx` references endpoints not implemented by this backend (legacy flow).
 
 ## More detail
 
-For a deeper explanation of the architecture and request flow, see `explanation.md`.
+See `explanation.md` for a deeper technical walkthrough and rationale.
